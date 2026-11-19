@@ -489,6 +489,23 @@ a:hover { text-decoration: underline; }
 .sstate-directive.model .del-btn { color: var(--muted); }
 .sstate-directive.model .del-btn:hover { color: var(--crit); }
 
+/* History Modal */
+.hist-grid { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; min-height: 360px; max-height: 62vh; }
+.hist-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; padding-right: 4px; border-right: 1px solid var(--border); }
+.hist-row { display: flex; flex-direction: column; gap: 3px; text-align: left; width: 100%; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 8px 10px; cursor: pointer; }
+.hist-row:hover { background: var(--surface-2); }
+.hist-row.on { background: var(--accent-soft); border-color: var(--accent); }
+.hist-row b { font-size: 12.5px; }
+.hist-pv { font-size: 12px; color: var(--ink-2); }
+.hist-detail { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 2px; }
+
+/* Inline Editable Compatible Endpoint Cards */
+.endpoint-card { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; background: var(--surface); display: flex; flex-direction: column; gap: 12px; }
+.endpoint-grid { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 12px; }
+.endpoint-models { display: flex; flex-direction: column; gap: 6px; }
+.endpoint-model { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 7px; background: var(--surface-2); border: 1px solid var(--border); }
+.endpoint-fetched { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); border: 1px dashed var(--border-strong); }
+
 /* ---------------------------------------------------------------- Right Semantic State Panel (状态记忆) */
 .sstate-wrap { display: flex; min-height: 0; background: var(--surface-2); border-left: 1px solid var(--border); position: relative; }
 .sstate-wrap.dragging { user-select: none; cursor: col-resize; }

@@ -167,7 +167,7 @@ export function HomePage() {
               <span>任务名称</span>
               <span>工作区</span>
               <span>模型 / 订阅</span>
-              <span>状态记忆</span>
+              <span>Token 用量</span>
               <span>最近更新</span>
               <span />
             </div>
@@ -184,21 +184,10 @@ export function HomePage() {
                   </div>
                   <div className="srow-ws truncate">{wsName}</div>
                   <div className="mono muted truncate" style={{ fontSize: 12 }}>
-                    {tk.modelId}
+                    {tk.modelId || "—"}
                   </div>
-                  <div>
-                    {tk.currentVersion > 0 ? (
-                      <Chip tone="accent" mono>
-                        v{tk.currentVersion}
-                      </Chip>
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                    {tk.totalTokens > 0 && (
-                      <span className="muted" style={{ marginLeft: 6, fontSize: 11.5 }}>
-                        {fmtTokens(tk.totalTokens)}
-                      </span>
-                    )}
+                  <div className="mono muted" style={{ fontSize: 12 }}>
+                    {tk.totalTokens > 0 ? fmtTokens(tk.totalTokens) : "—"}
                   </div>
                   <div className="srow-time">{relTime(tk.updatedAt, lang)}</div>
                   <div className="srow-actions" onClick={(e) => e.stopPropagation()}>

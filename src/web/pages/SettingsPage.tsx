@@ -1,6 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import type {
+  CompatibleEndpointModel,
+  CompatibleEndpointRecord,
+  EndpointProtocol,
+  EndpointThinkingMode,
   InstructionDoc,
   PermissionMode,
   PermissionRuleRecord,
@@ -9,7 +13,8 @@ import type {
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
-import { Button, Chip, Modal, Seg, Select, Status, Tabs, Toggle } from "../components/ui.js";
+import { ModelPicker, resolveThoughtLevelsForSelection } from "../components/ModelPicker.js";
+import { Button, Chip, Seg, Select, Status, Tabs } from "../components/ui.js";
 import { cx, isPlainEnter } from "../lib/format.js";
 
 export function SettingsPage() {
@@ -58,40 +63,89 @@ export function SettingsPage() {
 }
 
 function GeneralSettings() {
-  const { prefs, providers, updatePrefs, toast, t } = useApp();
+  const { prefs, providers, endpoints, updatePrefs, toast, t } = useApp();
+
+  // Compute effective default model & thought levels
+  const effectiveModelId = useMemo(() => {
+    if (prefs.defaultModelId) return prefs.defaultModelId;
+    if (prefs.defaultProviderId.startsWith("endpoint:")) {
+      const ep = endpoints.find((e) => `endpoint:${e.id}` === prefs.defaultProviderId);
+      return ep?.models[0]?.id || "";
+    }
+    const p = providers.find((x) => x.id === prefs.defaultProviderId);
+    return p?.defaultModel || p?.models[0]?.value || "";
+  }, [prefs.defaultProviderId, prefs.defaultModelId, providers, endpoints]);
+
+  const { levels: thoughtLevels, defaultLevel } = useMemo(
+    () =>
+      resolveThoughtLevelsForSelection(
+        providers,
+        endpoints,
+        prefs.defaultProviderId,
+        effectiveModelId
+      ),
+    [providers, endpoints, prefs.defaultProviderId, effectiveModelId]
+  );
+
+  const effectiveThought = thoughtLevels.some((l) => l.value === prefs.defaultThoughtLevel)
+    ? prefs.defaultThoughtLevel
+    : defaultLevel;
 
   return (
     <>
       <h1>{t("通用")}</h1>
-      <p className="lead">配置新建任务的默认订阅驱动、默认权限行为与自动验证策略。</p>
+      <p className="lead">配置新建任务时默认选用的模型、思考强度与工具权限级别。</p>
 
-      <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel">
         <div className="panel-head">
           <h3>新任务默认配置</h3>
         </div>
-        <div className="panel-body col" style={{ gap: 14 }}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
+        <div className="panel-body col" style={{ gap: 16 }}>
+          <div className="row" style={{ justifyContent: "space-between", gap: 16 }}>
             <div>
-              <b>默认订阅服务</b>
-              <div className="hint">新建任务时优先选用的智能体订阅</div>
+              <b>默认模型</b>
+              <div className="hint">新建任务时自动选用此模型（支持所有官方订阅与兼容端点）</div>
             </div>
-            <Select<ProviderId>
-              size="sm"
-              className="w-220"
-              icon="cpu"
-              value={prefs.defaultProviderId}
-              options={providers.map((p) => ({
-                value: p.id,
-                label: `${p.shortName} (${p.subscriptionLabel})`,
-              }))}
-              onChange={(v) => {
-                void updatePrefs({ defaultProviderId: v });
-                toast("已更新默认订阅服务", "good");
+            <ModelPicker
+              providerId={prefs.defaultProviderId}
+              modelId={effectiveModelId}
+              thoughtLevel={effectiveThought}
+              placement="bottom"
+              align="right"
+              borderless={false}
+              maxWidth={280}
+              onSelect={(next) => {
+                void updatePrefs({
+                  defaultProviderId: next.providerId,
+                  defaultModelId: next.modelId,
+                  defaultThoughtLevel: next.thoughtLevel,
+                });
+                toast("已更新默认模型", "good");
               }}
             />
           </div>
 
-          <div className="row" style={{ justifyContent: "space-between" }}>
+          {thoughtLevels.length > 0 && (
+            <div className="row" style={{ justifyContent: "space-between", gap: 16 }}>
+              <div>
+                <b>默认思考强度</b>
+                <div className="hint">根据上方所选模型动态匹配其支持的思考档位</div>
+              </div>
+              <Select
+                size="sm"
+                className="w-220"
+                icon="bulb"
+                value={effectiveThought}
+                options={thoughtLevels.map((lv) => ({ value: lv.value, label: lv.name }))}
+                onChange={(v) => {
+                  void updatePrefs({ defaultThoughtLevel: v });
+                  toast("已更新默认思考强度", "good");
+                }}
+              />
+            </div>
+          )}
+
+          <div className="row" style={{ justifyContent: "space-between", gap: 16 }}>
             <div>
               <b>默认权限模式</b>
               <div className="hint">新建任务时的工具确认级别（可在每个任务底部随时切换）</div>
@@ -109,45 +163,6 @@ function GeneralSettings() {
               onChange={(v) => {
                 void updatePrefs({ defaultPermissionMode: v });
                 toast("已更新默认权限模式", "good");
-              }}
-            />
-          </div>
-        </div>
-      </div>
-
-      <div className="panel">
-        <div className="panel-head">
-          <h3>自动化与质量守护</h3>
-        </div>
-        <div className="panel-body col" style={{ gap: 14 }}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <div>
-              <b>修改文件后强制要求验证</b>
-              <div className="hint">
-                当智能体修改了代码文件却尚未运行构建或测试命令时，阻止其直接将任务标记为已完成
-              </div>
-            </div>
-            <Toggle
-              on={prefs.autoVerifyEdits}
-              onChange={(next) => void updatePrefs({ autoVerifyEdits: next })}
-            />
-          </div>
-
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <div>
-              <b>单次指令最大连续推进轮数</b>
-              <div className="hint">防止无人值守复杂任务无限循环，到达上限后自动暂停等待确认</div>
-            </div>
-            <input
-              type="number"
-              min={1}
-              max={30}
-              className="input sm mono"
-              style={{ width: 80, textAlign: "center" }}
-              value={prefs.maxAutoContinues}
-              onChange={(e) => {
-                const val = Math.min(30, Math.max(1, Number(e.target.value) || 10));
-                void updatePrefs({ maxAutoContinues: val });
               }}
             />
           </div>
@@ -295,7 +310,12 @@ function PermissionsSettings() {
               value={note}
               onChange={(e) => setNote(e.target.value)}
             />
-            <Button variant="primary" size="sm" disabled={!pattern.trim()} onClick={() => void handleAdd()}>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!pattern.trim()}
+              onClick={() => void handleAdd()}
+            >
               添加规则
             </Button>
           </div>
@@ -411,16 +431,18 @@ function InstructionsSettings() {
   );
 }
 
+const THINKING_MODE_OPTIONS: Array<{ value: EndpointThinkingMode; label: string; desc: string }> = [
+  { value: "none", label: "不支持思考", desc: "对话区自动隐藏思考强度选项" },
+  { value: "toggle", label: "开关思考 (开/关)", desc: "支持开启或关闭扩展思考" },
+  { value: "standard", label: "标准档位 (低/中/高)", desc: "支持 Low / Medium / High" },
+  { value: "extended", label: "扩展档位 (含极高)", desc: "支持 Low / Medium / High / Extra" },
+];
+
 function ProviderSettings() {
-  const { providers, setProviders, endpoints, setEndpoints, prefs, updatePrefs, toast, t } =
-    useApp();
-  const [selectedId, setSelectedId] = useState<ProviderId>(prefs.defaultProviderId || "agy");
+  const { providers, setProviders, endpoints, setEndpoints, toast, t } = useApp();
+  const [selectedId, setSelectedId] = useState<ProviderId>("agy");
   const [checkingId, setCheckingId] = useState<ProviderId | null>(null);
-  const [epModalOpen, setEpModalOpen] = useState(false);
-  const [epName, setEpName] = useState("");
-  const [epUrl, setEpUrl] = useState("");
-  const [epKey, setEpKey] = useState("");
-  const [epModels, setEpModels] = useState("");
+  const [addingEp, setAddingEp] = useState(false);
 
   useEffect(() => {
     void api
@@ -447,28 +469,20 @@ function ProviderSettings() {
     }
   };
 
-  const handleAddEndpoint = async () => {
-    if (!epName.trim() || !epUrl.trim()) return;
+  const handleCreateEndpointCard = async () => {
+    setAddingEp(true);
     try {
-      const models = epModels
-        .split(",")
-        .map((m) => m.trim())
-        .filter(Boolean);
       const res = await api.addEndpoint({
-        name: epName,
-        baseUrl: epUrl,
-        apiKey: epKey,
-        models: models.length > 0 ? models : ["default"],
+        name: "新兼容端点",
+        protocol: "anthropic",
+        baseUrl: "",
+        models: [],
       });
-      setEndpoints([res.endpoint, ...endpoints]);
-      setEpModalOpen(false);
-      setEpName("");
-      setEpUrl("");
-      setEpKey("");
-      setEpModels("");
-      toast(`已添加兼容端点：${res.endpoint.name}`, "good");
+      setEndpoints(res.endpoints);
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setAddingEp(false);
     }
   };
 
@@ -476,8 +490,8 @@ function ProviderSettings() {
     <>
       <h1>{t("订阅与模型")}</h1>
       <p className="lead">
-        通过标准 Agent Client Protocol (ACP) 直接复用你在各家官方 CLI 中已登录的个人/团队订阅额度，Avent
-        不保存也不触碰你的原始账号凭据。
+        通过标准 Agent Client Protocol (ACP) 实时同步你在各家官方 CLI 中已登录的订阅模型与思考档位；同时支持配置自定义兼容
+        API 端点并通过本地 ACP 桥接执行。
       </p>
 
       <div className="provider-cards">
@@ -490,14 +504,13 @@ function ProviderSettings() {
             <div className="row" style={{ width: "100%" }}>
               <b>{p.name}</b>
               <span className="grow" />
-              <Status tone={p.available ? "good" : "idle"}>
-                {p.available ? (p.verified ? "已验证" : "已安装") : "未就绪"}
+              <Status tone={p.available ? (p.models.length > 0 ? "good" : "info") : "idle"}>
+                {p.available ? (p.models.length > 0 ? "已同步" : "待检测") : "未就绪"}
               </Status>
             </div>
             <div className="d">{p.subscriptionLabel}</div>
             <div className="row" style={{ marginTop: 4 }}>
               <Chip mono>{p.models.length} 个模型</Chip>
-              {prefs.defaultProviderId === p.id && <Chip tone="accent">默认</Chip>}
             </div>
           </div>
         ))}
@@ -510,17 +523,6 @@ function ProviderSettings() {
             <h3>{selected.name}</h3>
             <Chip tone="accent">{selected.subscriptionLabel}</Chip>
             <div className="actions">
-              {prefs.defaultProviderId !== selected.id && (
-                <Button
-                  size="sm"
-                  onClick={() => {
-                    void updatePrefs({ defaultProviderId: selected.id });
-                    toast(`已将 ${selected.shortName} 设为默认订阅`, "good");
-                  }}
-                >
-                  设为默认
-                </Button>
-              )}
               <Button
                 size="sm"
                 icon="copy"
@@ -559,146 +561,360 @@ function ProviderSettings() {
 
             <div>
               <div className="section-title">
-                支持切换的模型（共 {selected.models.length} 个
-                {selected.lastProbedAt ? " · 已实时同步思考强度" : " · 点击重新检测可动态同步"}）
+                ACP 实时模型列表（共 {selected.models.length} 个）
               </div>
-              <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-                {selected.models.map((m) => {
-                  const tlLabel =
-                    m.thoughtLevels === undefined
-                      ? ""
-                      : m.thoughtLevels.length === 0
-                        ? " · 无独立思考档位"
-                        : ` · ${m.thoughtLevels.map((l) => l.value).join("/")}`;
-                  return (
-                    <Chip key={m.value} outline mono title={`${m.value}${tlLabel}`}>
-                      {m.name}
-                      {tlLabel && (
-                        <span className="muted" style={{ fontWeight: 400 }}>
-                          {tlLabel}
-                        </span>
-                      )}
-                    </Chip>
-                  );
-                })}
-              </div>
+              {selected.models.length === 0 ? (
+                <div className="hint">
+                  尚未从该订阅获取到模型列表。请先在终端登录对应 CLI 后点击右上角「重新检测」。
+                </div>
+              ) : (
+                <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+                  {selected.models.map((m) => {
+                    const tlLabel =
+                      m.thoughtLevels === undefined
+                        ? ""
+                        : m.thoughtLevels.length === 0
+                          ? " · 无独立思考档位"
+                          : ` · ${m.thoughtLevels.map((l) => l.value).join("/")}`;
+                    return (
+                      <Chip key={m.value} outline mono title={`${m.value}${tlLabel}`}>
+                        {m.name}
+                        {tlLabel && (
+                          <span className="muted" style={{ fontWeight: 400 }}>
+                            {tlLabel}
+                          </span>
+                        )}
+                      </Chip>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* Compatible API Endpoints */}
+      {/* Inline Editable Compatible API Endpoints */}
       <div className="panel">
         <div className="panel-head">
           <h3>自定义兼容 API 端点</h3>
-          <span className="sub">可选配置企业网关或自建兼容服务</span>
+          <span className="sub">支持随时编辑地址、令牌，以及逐个增删模型与独立配置思考档位</span>
           <div className="actions">
-            <Button size="sm" icon="plus" onClick={() => setEpModalOpen(true)}>
+            <Button
+              variant="primary"
+              size="sm"
+              icon="plus"
+              busy={addingEp}
+              onClick={() => void handleCreateEndpointCard()}
+            >
               添加端点
             </Button>
           </div>
         </div>
-        <div className="panel-body">
+        <div className="panel-body col" style={{ gap: 14 }}>
           {endpoints.length === 0 ? (
-            <div className="empty" style={{ padding: "14px 8px" }}>
-              暂未配置自定义兼容端点（日常直接使用上方官方订阅驱动即可）
+            <div className="empty" style={{ padding: "18px 8px" }}>
+              暂未配置兼容 API 端点。点击右上角「添加端点」可接入 Anthropic 或 OpenAI 兼容网关，并自由管理其下的模型列表。
             </div>
           ) : (
-            <div className="col" style={{ gap: 8 }}>
-              {endpoints.map((ep) => (
-                <div
-                  key={ep.id}
-                  className="row"
-                  style={{
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    padding: "8px 12px",
-                  }}
-                >
-                  <div>
-                    <b>{ep.name}</b>
-                    <div className="mono muted" style={{ fontSize: 11.5 }}>
-                      {ep.baseUrl} · Key: {ep.apiKeyHint}
-                    </div>
-                  </div>
-                  <span className="grow" />
-                  {ep.models.map((m) => (
-                    <Chip key={m} mono>
-                      {m}
-                    </Chip>
-                  ))}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    icon="trash"
-                    onClick={async () => {
-                      await api.deleteEndpoint(ep.id);
-                      setEndpoints(endpoints.filter((x) => x.id !== ep.id));
-                    }}
-                  />
-                </div>
-              ))}
-            </div>
+            endpoints.map((ep) => <EndpointEditor key={ep.id} endpoint={ep} />)
           )}
         </div>
       </div>
+    </>
+  );
+}
 
-      <Modal
-        open={epModalOpen}
-        onClose={() => setEpModalOpen(false)}
-        title="添加自定义兼容端点"
-        footer={
-          <>
-            <Button onClick={() => setEpModalOpen(false)}>{t("取消")}</Button>
-            <Button
-              variant="primary"
-              disabled={!epName.trim() || !epUrl.trim()}
-              onClick={() => void handleAddEndpoint()}
-            >
-              {t("保存")}
-            </Button>
-          </>
-        }
-      >
+function EndpointEditor({ endpoint }: { endpoint: CompatibleEndpointRecord }) {
+  const { setEndpoints, toast } = useApp();
+  const [name, setName] = useState(endpoint.name);
+  const [baseUrl, setBaseUrl] = useState(endpoint.baseUrl);
+  const [keyInput, setKeyInput] = useState("");
+  const [newModelId, setNewModelId] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+
+  useEffect(() => {
+    setName(endpoint.name);
+    setBaseUrl(endpoint.baseUrl);
+  }, [endpoint.id, endpoint.name, endpoint.baseUrl]);
+
+  const patchEndpoint = async (
+    patch: Parameters<typeof api.updateEndpoint>[1],
+    toastMsg?: string
+  ) => {
+    try {
+      const res = await api.updateEndpoint(endpoint.id, patch);
+      setEndpoints(res.endpoints);
+      if (toastMsg) toast(toastMsg, "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const handleAddModel = (modelIdRaw?: string) => {
+    const id = (modelIdRaw ?? newModelId).trim();
+    if (!id) return;
+    if (endpoint.models.some((m) => m.id === id)) {
+      toast(`模型 ${id} 已存在于当前端点`, "warn");
+      return;
+    }
+    const nextModels: CompatibleEndpointModel[] = [
+      ...endpoint.models,
+      { id, thinkingMode: "none" },
+    ];
+    if (!modelIdRaw) setNewModelId("");
+    void patchEndpoint({ models: nextModels });
+  };
+
+  const handleUpdateModelThinking = (modelId: string, thinkingMode: EndpointThinkingMode) => {
+    const nextModels = endpoint.models.map((m) =>
+      m.id === modelId ? { ...m, thinkingMode } : m
+    );
+    void patchEndpoint({ models: nextModels });
+  };
+
+  const handleRemoveModel = (modelId: string) => {
+    const nextModels = endpoint.models.filter((m) => m.id !== modelId);
+    void patchEndpoint({ models: nextModels });
+  };
+
+  const handleFetchModels = async () => {
+    setFetching(true);
+    try {
+      // Save latest URL if user just typed it before clicking fetch
+      if (baseUrl.trim() !== endpoint.baseUrl) {
+        await patchEndpoint({ baseUrl: baseUrl.trim() });
+      }
+      const res = await api.fetchEndpointModels(endpoint.id);
+      if (res.ok && res.models.length > 0) {
+        setFetchedModels(res.models);
+        toast(`从端点发现 ${res.models.length} 个模型，点击下方标签即可加入`, "good");
+      } else {
+        toast(res.error || "端点未返回可用模型列表", "warn");
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "warn");
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  const handleDeleteEndpoint = async () => {
+    try {
+      const res = await api.deleteEndpoint(endpoint.id);
+      setEndpoints(res.endpoints);
+      toast(`已删除兼容端点：${endpoint.name}`, "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const unaddedFetched = fetchedModels.filter(
+    (id) => !endpoint.models.some((m) => m.id === id)
+  );
+
+  return (
+    <div className="endpoint-card">
+      <div className="endpoint-grid">
         <div className="field">
           <label>端点名称</label>
           <input
-            className="input"
-            placeholder="例如：内部网关 / OpenRouter"
-            value={epName}
-            onChange={(e) => setEpName(e.target.value)}
+            className="input sm"
+            placeholder="例如：DeepSeek / OpenRouter / 公司网关"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onBlur={() => {
+              if (name.trim() && name.trim() !== endpoint.name) {
+                void patchEndpoint({ name: name.trim() });
+              }
+            }}
           />
         </div>
+
+        <div className="field">
+          <label>接口协议（执行桥接）</label>
+          <Select<EndpointProtocol>
+            size="sm"
+            value={endpoint.protocol}
+            options={[
+              {
+                value: "anthropic",
+                label: "Anthropic 兼容 (Claude ACP)",
+                desc: "通过 claude-agent-acp 调用 /v1/messages",
+              },
+              {
+                value: "openai",
+                label: "OpenAI 兼容 (Codex ACP)",
+                desc: "通过 codex-acp 调用 OpenAI 兼容网关",
+              },
+            ]}
+            onChange={(protocol) => void patchEndpoint({ protocol })}
+          />
+        </div>
+      </div>
+
+      <div className="endpoint-grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <div className="field">
           <label>Base URL</label>
           <input
-            className="input mono"
-            placeholder="https://api.example.com/v1"
-            value={epUrl}
-            onChange={(e) => setEpUrl(e.target.value)}
+            className="input sm mono"
+            placeholder={
+              endpoint.protocol === "anthropic"
+                ? "https://api.deepseek.com/anthropic"
+                : "https://openrouter.ai/api/v1"
+            }
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            onBlur={() => {
+              if (baseUrl.trim() !== endpoint.baseUrl) {
+                void patchEndpoint({ baseUrl: baseUrl.trim() });
+              }
+            }}
           />
         </div>
+
         <div className="field">
-          <label>API Key (仅脱敏存储提示)</label>
-          <input
-            type="password"
-            className="input mono"
-            placeholder="sk-..."
-            value={epKey}
-            onChange={(e) => setEpKey(e.target.value)}
-          />
+          <label>
+            认证令牌 (API Key) ·{" "}
+            <span className="muted" style={{ fontWeight: 400 }}>
+              {endpoint.apiKeySet ? `已保存 (${endpoint.apiKeyHint})` : "未设置"}
+            </span>
+          </label>
+          <div className="row" style={{ gap: 6 }}>
+            <input
+              type="password"
+              className="input sm mono grow"
+              placeholder={endpoint.apiKeySet ? "输入新令牌以替换…" : "sk-...（本地免鉴权可留空）"}
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+            />
+            <Button
+              size="sm"
+              disabled={!keyInput.trim()}
+              onClick={() => {
+                void patchEndpoint({ apiKey: keyInput.trim() }, "已安全保存认证令牌");
+                setKeyInput("");
+              }}
+            >
+              保存令牌
+            </Button>
+            {endpoint.apiKeySet && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void patchEndpoint({ apiKey: "" }, "已清除认证令牌")}
+              >
+                清除
+              </Button>
+            )}
+          </div>
         </div>
-        <div className="field">
-          <label>模型列表 (逗号分隔)</label>
-          <input
-            className="input mono"
-            placeholder="claude-sonnet-4-5, deepseek-v3"
-            value={epModels}
-            onChange={(e) => setEpModels(e.target.value)}
-          />
+      </div>
+
+      {/* Per-Model Editable List */}
+      <div className="endpoint-models">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <span className="field-label">模型列表（{endpoint.models.length}）</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon="refresh"
+            busy={fetching}
+            disabled={!baseUrl.trim()}
+            title="请求端点的 /models 接口自动发现可用模型"
+            onClick={() => void handleFetchModels()}
+          >
+            从端点拉取模型
+          </Button>
         </div>
-      </Modal>
-    </>
+
+        {endpoint.models.length === 0 ? (
+          <div className="hint">
+            尚未添加模型。在下方输入端点接受的模型 ID（例如 <code className="mono">deepseek-reasoner</code>）并回车添加。
+          </div>
+        ) : (
+          endpoint.models.map((m) => (
+            <div key={m.id} className="endpoint-model">
+              <span className="mono grow truncate" style={{ fontWeight: 600 }} title={m.id}>
+                {m.id}
+              </span>
+              <Select<EndpointThinkingMode>
+                size="sm"
+                className="w-180"
+                icon="bulb"
+                value={m.thinkingMode}
+                options={THINKING_MODE_OPTIONS}
+                onChange={(tm) => handleUpdateModelThinking(m.id, tm)}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                icon="trash"
+                title="删除此模型"
+                onClick={() => handleRemoveModel(m.id)}
+              />
+            </div>
+          ))
+        )}
+
+        {unaddedFetched.length > 0 && (
+          <div className="endpoint-fetched">
+            <span className="hint" style={{ width: "100%" }}>
+              端点返回的模型（点击直接加入）：
+            </span>
+            {unaddedFetched.slice(0, 24).map((mid) => (
+              <Chip
+                key={mid}
+                outline
+                mono
+                icon="plus"
+                onClick={() => handleAddModel(mid)}
+              >
+                {mid}
+              </Chip>
+            ))}
+          </div>
+        )}
+
+        <div className="row" style={{ gap: 8, marginTop: 2 }}>
+          <input
+            className="input sm mono grow"
+            placeholder="输入要添加的模型 ID（如 deepseek-chat / qwen3-coder）…"
+            value={newModelId}
+            onChange={(e) => setNewModelId(e.target.value)}
+            onKeyDown={(e) => {
+              if (isPlainEnter(e)) handleAddModel();
+            }}
+          />
+          <Button
+            size="sm"
+            icon="plus"
+            disabled={!newModelId.trim()}
+            onClick={() => handleAddModel()}
+          >
+            添加模型
+          </Button>
+        </div>
+      </div>
+
+      <div className="row" style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+        <span className="hint">
+          {endpoint.protocol === "anthropic"
+            ? "运行时自动注入 ANTHROPIC_BASE_URL 与隔离令牌，绝不占用你的 Claude 订阅额度"
+            : "运行时自动注入 OPENAI_BASE_URL 与隔离令牌，绝不占用你的 Codex 订阅额度"}
+        </span>
+        <span className="grow" />
+        <Button
+          variant="danger-outline"
+          size="sm"
+          icon="trash"
+          onClick={() => void handleDeleteEndpoint()}
+        >
+          删除端点
+        </Button>
+      </div>
+    </div>
   );
 }
 

@@ -186,10 +186,7 @@ export function TaskPage() {
                 <span className={cx("sdot", st.dotClass)} />
                 <div className="grow" style={{ minWidth: 0 }}>
                   <div className="t truncate">{tk.title}</div>
-                  <div className="m">
-                    {tk.currentVersion > 0 ? `v${tk.currentVersion} · ` : ""}
-                    {relTime(tk.updatedAt, lang)}
-                  </div>
+                  <div className="m">{relTime(tk.updatedAt, lang)}</div>
                 </div>
                 <div className="scol-acts" onClick={(e) => e.stopPropagation()}>
                   <Button
@@ -276,7 +273,6 @@ export function TaskPage() {
                 onClick={() => setStatePanelOpen(!statePanelOpen)}
               >
                 {t("状态记忆")}
-                {currentTask.currentVersion > 0 ? ` v${currentTask.currentVersion}` : ""}
               </Button>
             </header>
 

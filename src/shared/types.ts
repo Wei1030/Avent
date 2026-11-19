@@ -367,23 +367,60 @@ export interface PermissionRuleRecord {
   createdAt: string;
 }
 
+export type EndpointProtocol = "anthropic" | "openai";
+
+export type EndpointThinkingMode = "none" | "toggle" | "standard" | "extended";
+
+export interface CompatibleEndpointModel {
+  id: string;
+  name?: string;
+  thinkingMode: EndpointThinkingMode;
+}
+
 export interface CompatibleEndpointRecord {
   id: string;
   name: string;
+  protocol: EndpointProtocol;
   baseUrl: string;
+  apiKeySet: boolean;
   apiKeyHint: string;
-  models: string[];
+  models: CompatibleEndpointModel[];
   enabled: boolean;
   createdAt: string;
 }
 
+export function thinkingModeToLevels(mode: EndpointThinkingMode): ThoughtLevelOption[] {
+  switch (mode) {
+    case "toggle":
+      return [
+        { value: "off", name: "关闭 (Off)" },
+        { value: "high", name: "开启 (On)" },
+      ];
+    case "standard":
+      return [
+        { value: "low", name: "低 (Low)" },
+        { value: "medium", name: "中 (Medium)" },
+        { value: "high", name: "高 (High)" },
+      ];
+    case "extended":
+      return [
+        { value: "low", name: "低 (Low)" },
+        { value: "medium", name: "中 (Medium)" },
+        { value: "high", name: "高 (High)" },
+        { value: "xhigh", name: "极高 (Extra)" },
+      ];
+    default:
+      return [];
+  }
+}
+
 export interface AppPreferences {
   uiLanguage: "auto" | "zh-CN" | "en";
-  defaultProviderId: ProviderId;
+  defaultProviderId: TaskProviderId;
+  defaultModelId: string;
+  defaultThoughtLevel: string;
   defaultPermissionMode: PermissionMode;
-  autoVerifyEdits: boolean;
   desktopNotifications: boolean;
-  maxAutoContinues: number;
 }
 
 export interface InstructionDoc {
@@ -441,6 +478,7 @@ export interface TaskDetailResponse {
 export type LiveStreamEvent =
   | { type: "workspace_updated"; workspaces: WorkspaceRecord[] }
   | { type: "providers_updated"; providers: ProviderStatusInfo[] }
+  | { type: "endpoints_updated"; endpoints: CompatibleEndpointRecord[] }
   | { type: "task_updated"; task: TaskRecord }
   | { type: "task_deleted"; taskId: string }
   | { type: "item_upserted"; taskId: string; item: TranscriptItem }

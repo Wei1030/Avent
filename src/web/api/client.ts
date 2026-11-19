@@ -3,7 +3,9 @@ import type {
   ApprovalDecisionPayload,
   ApprovalRequest,
   AttachmentItem,
+  CompatibleEndpointModel,
   CompatibleEndpointRecord,
+  EndpointProtocol,
   InstructionDoc,
   McpServerRecord,
   PermissionMode,
@@ -284,12 +286,49 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
-  addEndpoint: (body: { name: string; baseUrl: string; apiKey?: string; models: string[] }) =>
-    req<{ endpoint: CompatibleEndpointRecord }>("/api/endpoints", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  addEndpoint: (body?: {
+    name?: string;
+    protocol?: EndpointProtocol;
+    baseUrl?: string;
+    apiKey?: string;
+    models?: CompatibleEndpointModel[];
+  }) =>
+    req<{ endpoint: CompatibleEndpointRecord; endpoints: CompatibleEndpointRecord[] }>(
+      "/api/endpoints",
+      {
+        method: "POST",
+        body: JSON.stringify(body ?? {}),
+      }
+    ),
+
+  updateEndpoint: (
+    id: string,
+    patch: {
+      name?: string;
+      protocol?: EndpointProtocol;
+      baseUrl?: string;
+      apiKey?: string | null;
+      models?: CompatibleEndpointModel[];
+      enabled?: boolean;
+    }
+  ) =>
+    req<{ endpoint: CompatibleEndpointRecord; endpoints: CompatibleEndpointRecord[] }>(
+      `/api/endpoints/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }
+    ),
+
+  fetchEndpointModels: (id: string) =>
+    req<{ ok: boolean; models: string[]; error?: string }>(
+      `/api/endpoints/${encodeURIComponent(id)}/fetch-models`,
+      { method: "POST" }
+    ),
 
   deleteEndpoint: (id: string) =>
-    req<{ ok: boolean }>(`/api/endpoints/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    req<{ ok: boolean; endpoints: CompatibleEndpointRecord[] }>(
+      `/api/endpoints/${encodeURIComponent(id)}`,
+      { method: "DELETE" }
+    ),
 };

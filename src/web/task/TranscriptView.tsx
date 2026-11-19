@@ -154,7 +154,6 @@ export function TranscriptView({
                     第 {blk.turn} 轮 · {fmtDuration(blk.seconds)}
                     {blk.toolCalls > 0 ? ` · ${blk.toolCalls} 次工具调用` : ""} ·{" "}
                     {fmtTokens(blk.tokens)} tokens
-                    {blk.stateVersion ? ` · 状态记忆已更新至 v${blk.stateVersion}` : ""}
                   </>
                 )}
               </div>

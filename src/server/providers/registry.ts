@@ -5,6 +5,8 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import type { AventStore } from "../db.js";
 import type {
+  EndpointProtocol,
+  EndpointThinkingMode,
   PersistedProviderCapabilities,
   ProviderId,
   ProviderModelOption,
@@ -17,10 +19,12 @@ export interface ProviderLaunchSpec {
   command: string;
   args: string[];
   env: Record<string, string>;
+  unsetEnv?: string[];
   info: ProviderStatusInfo;
 }
 
 const THOUGHT_LABEL_MAP: Record<string, string> = {
+  default: "默认 (Default)",
   off: "关闭 (Off)",
   none: "关闭 (None)",
   minimal: "极简 (Minimal)",
@@ -159,7 +163,21 @@ export class ProviderRegistry {
     // Hydrate persisted capabilities from SQLite immediately so restarts retain live models & thought levels
     if (this.store) {
       for (const cap of this.store.listProviderCapabilities()) {
-        this.capsByProvider.set(cap.providerId, cap);
+        const normalized: PersistedProviderCapabilities = {
+          ...cap,
+          thoughtLevels: cap.thoughtLevels?.map((l) => ({
+            value: l.value,
+            name: formatThoughtLevelLabel(l.value, l.name),
+          })),
+          models: cap.models.map((m) => ({
+            ...m,
+            thoughtLevels: m.thoughtLevels?.map((l) => ({
+              value: l.value,
+              name: formatThoughtLevelLabel(l.value, l.name),
+            })),
+          })),
+        };
+        this.capsByProvider.set(cap.providerId, normalized);
         this.verifiedLive.add(cap.providerId);
       }
     }
@@ -267,6 +285,65 @@ export class ProviderRegistry {
       throw new Error(`Unknown provider: ${providerId}`);
     }
     return found;
+  }
+
+  /**
+   * Route A: Executes a compatible API endpoint through the matching ACP bridge
+   * (`claude-agent-acp` for Anthropic Messages endpoints, `codex-acp` for OpenAI endpoints),
+   * strictly isolating user subscription credentials from third-party endpoints.
+   */
+  public getEndpointLaunchSpec(params: {
+    protocol: EndpointProtocol;
+    baseUrl: string;
+    apiKey: string;
+    modelId: string;
+    thinkingMode: EndpointThinkingMode;
+    thoughtLevel?: string;
+  }): ProviderLaunchSpec {
+    const bridgeProvider: ProviderId = params.protocol === "openai" ? "codex" : "claude";
+    const baseSpec = this.getLaunchSpec(bridgeProvider);
+    if (!baseSpec.info.available) {
+      const cliHint =
+        bridgeProvider === "claude"
+          ? "需先在本机安装 claude CLI 以驱动 Anthropic 兼容端点"
+          : "需先在本机安装 codex CLI 以驱动 OpenAI 兼容端点";
+      throw new Error(`无法启动兼容端点执行驱动：${cliHint}`);
+    }
+
+    const token = params.apiKey.trim() || "no-token";
+    if (params.protocol === "anthropic") {
+      const disableThinking =
+        params.thinkingMode === "none" || params.thoughtLevel === "off";
+      return {
+        ...baseSpec,
+        unsetEnv: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+        env: {
+          ...baseSpec.env,
+          ANTHROPIC_BASE_URL: params.baseUrl.trim(),
+          ANTHROPIC_AUTH_TOKEN: token,
+          ANTHROPIC_MODEL: params.modelId,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: params.modelId,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: params.modelId,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: params.modelId,
+          ANTHROPIC_DEFAULT_FABLE_MODEL: params.modelId,
+          ANTHROPIC_SMALL_FAST_MODEL: params.modelId,
+          CLAUDE_CODE_SUBAGENT_MODEL: params.modelId,
+          ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+          ...(disableThinking ? { MAX_THINKING_TOKENS: "0" } : {}),
+        },
+      };
+    }
+
+    return {
+      ...baseSpec,
+      unsetEnv: ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+      env: {
+        ...baseSpec.env,
+        OPENAI_BASE_URL: params.baseUrl.trim(),
+        OPENAI_API_KEY: token,
+        OPENAI_MODEL: params.modelId,
+      },
+    };
   }
 
   public listProviderStatuses(): ProviderStatusInfo[] {
@@ -477,62 +554,11 @@ export class ProviderRegistry {
     const mergedPath = getMergedUserSystemPath();
     const bins = this.resolveCachedBins();
 
-    // 1. Google Antigravity ACP (`agy acp`)
+    // 1. Google Antigravity ACP (`agy acp`) — 100% ACP-discovered models & thought levels
     const agyBin = bins.agy;
     const agyCap = this.capsByProvider.get("agy");
     const agyTier = agyCap?.tierName;
-    const defaultAgyLevels: ThoughtLevelOption[] = [
-      { value: "low", name: "低 (Low)" },
-      { value: "medium", name: "中 (Medium)" },
-      { value: "high", name: "高 (High)" },
-      { value: "xhigh", name: "极高 (Extra)" },
-    ];
-    const agyModels: ProviderModelOption[] = agyCap?.models?.length
-      ? agyCap.models
-      : [
-          {
-            value: "gemini-4-neon",
-            name: "Gemini 4 Neon",
-            thoughtLevels: defaultAgyLevels,
-            defaultThoughtLevel: "high",
-          },
-          {
-            value: "gemini-4-carbon",
-            name: "Gemini 4 Carbon",
-            thoughtLevels: defaultAgyLevels.slice(0, 3),
-            defaultThoughtLevel: "high",
-          },
-          {
-            value: "gemini-4-argon",
-            name: "Gemini 4 Argon",
-            thoughtLevels: defaultAgyLevels.slice(0, 3),
-            defaultThoughtLevel: "high",
-          },
-          {
-            value: "gemini-4-hydrogen",
-            name: "Gemini 4 Hydrogen",
-            thoughtLevels: defaultAgyLevels,
-            defaultThoughtLevel: "high",
-          },
-          {
-            value: "gemini-3.8-flash",
-            name: "Gemini 3.8 Flash",
-            thoughtLevels: defaultAgyLevels.slice(0, 3),
-            defaultThoughtLevel: "medium",
-          },
-          {
-            value: "claude-opus-5-5",
-            name: "Claude Opus 5.5",
-            thoughtLevels: defaultAgyLevels.slice(0, 3),
-            defaultThoughtLevel: "medium",
-          },
-          {
-            value: "claude-sonnet-5-5",
-            name: "Claude Sonnet 5.5",
-            thoughtLevels: defaultAgyLevels.slice(0, 3),
-            defaultThoughtLevel: "medium",
-          },
-        ];
+    const agyModels: ProviderModelOption[] = agyCap?.models ?? [];
 
     const agySpec: ProviderLaunchSpec = {
       id: "agy",
@@ -546,7 +572,7 @@ export class ProviderRegistry {
         subscriptionLabel: agyTier || "Google AI Pro / Ultra",
         adapterLabel: "Native ACP (agy acp)",
         available: Boolean(agyBin),
-        verified: Boolean(agyBin) && this.verifiedLive.has("agy"),
+        verified: Boolean(agyBin) && Boolean(agyCap),
         tierName: agyTier,
         binaryPath: agyBin,
         loginCommand: "agy acp --login",
@@ -554,14 +580,14 @@ export class ProviderRegistry {
           ? `已就绪${agyTier ? ` · ${agyTier}` : ""} (${path.basename(agyBin)})`
           : "未检测到 agy CLI（安装 Google.AntigravityCLI 后在终端执行 agy acp --login）",
         models: agyModels,
-        defaultModel: agyCap?.defaultModel || agyModels[0]?.value || "gemini-4-neon",
-        thoughtLevels: agyCap?.thoughtLevels ?? defaultAgyLevels,
-        defaultThoughtLevel: agyCap?.defaultThoughtLevel || "high",
+        defaultModel: agyCap?.defaultModel || agyModels[0]?.value || "",
+        thoughtLevels: agyCap?.thoughtLevels ?? [],
+        defaultThoughtLevel: agyCap?.defaultThoughtLevel || "",
         lastProbedAt: agyCap?.probedAt,
       },
     };
 
-    // 2. Anthropic Claude Code ACP (`@agentclientprotocol/claude-agent-acp`)
+    // 2. Anthropic Claude Code ACP (`@agentclientprotocol/claude-agent-acp`) — 100% ACP-discovered
     const claudeBridgeJs = path.join(
       this.projectRoot,
       "node_modules",
@@ -573,11 +599,7 @@ export class ProviderRegistry {
     const claudeCliBin = bins.claude;
     const claudeBridgeExists = existsSync(claudeBridgeJs);
     const claudeCap = this.capsByProvider.get("claude");
-    const claudeDefaultLevels: ThoughtLevelOption[] = [
-      { value: "low", name: "低 (Low)" },
-      { value: "medium", name: "中 (Medium)" },
-      { value: "high", name: "高 (High)" },
-    ];
+    const claudeModels: ProviderModelOption[] = claudeCap?.models ?? [];
 
     const claudeSpec: ProviderLaunchSpec = {
       id: "claude",
@@ -591,7 +613,7 @@ export class ProviderRegistry {
         subscriptionLabel: claudeCap?.tierName || "Claude Pro / Max",
         adapterLabel: "@agentclientprotocol/claude-agent-acp",
         available: claudeBridgeExists && Boolean(claudeCliBin),
-        verified: this.verifiedLive.has("claude"),
+        verified: Boolean(claudeCap),
         tierName: claudeCap?.tierName,
         binaryPath: claudeCliBin,
         loginCommand: "claude /login",
@@ -599,21 +621,15 @@ export class ProviderRegistry {
           claudeBridgeExists && claudeCliBin
             ? `已接入适配器 (${path.basename(claudeCliBin)} 已安装)`
             : "已内置适配器（需本地安装并在终端登录 claude CLI）",
-        models: claudeCap?.models?.length
-          ? claudeCap.models
-          : [
-              { value: "default", name: "Claude Default (Subscription)" },
-              { value: "claude-opus-4-5", name: "Claude Opus" },
-              { value: "claude-sonnet-4-5", name: "Claude Sonnet" },
-            ],
-        defaultModel: claudeCap?.defaultModel || "default",
-        thoughtLevels: claudeCap?.thoughtLevels ?? claudeDefaultLevels,
-        defaultThoughtLevel: claudeCap?.defaultThoughtLevel || "high",
+        models: claudeModels,
+        defaultModel: claudeCap?.defaultModel || claudeModels[0]?.value || "",
+        thoughtLevels: claudeCap?.thoughtLevels ?? [],
+        defaultThoughtLevel: claudeCap?.defaultThoughtLevel || "",
         lastProbedAt: claudeCap?.probedAt,
       },
     };
 
-    // 3. OpenAI Codex ACP (`@agentclientprotocol/codex-acp`)
+    // 3. OpenAI Codex ACP (`@agentclientprotocol/codex-acp`) — 100% ACP-discovered
     const codexBridgeJs = path.join(
       this.projectRoot,
       "node_modules",
@@ -625,12 +641,7 @@ export class ProviderRegistry {
     const codexCliBin = bins.codex;
     const codexBridgeExists = existsSync(codexBridgeJs);
     const codexCap = this.capsByProvider.get("codex");
-    const codexDefaultLevels: ThoughtLevelOption[] = [
-      { value: "low", name: "低 (Low)" },
-      { value: "medium", name: "中 (Medium)" },
-      { value: "high", name: "高 (High)" },
-      { value: "xhigh", name: "极高 (Extra)" },
-    ];
+    const codexModels: ProviderModelOption[] = codexCap?.models ?? [];
 
     const codexSpec: ProviderLaunchSpec = {
       id: "codex",
@@ -644,22 +655,17 @@ export class ProviderRegistry {
         subscriptionLabel: codexCap?.tierName || "ChatGPT Plus / Pro",
         adapterLabel: "@agentclientprotocol/codex-acp",
         available: codexBridgeExists && Boolean(codexCliBin),
-        verified: this.verifiedLive.has("codex"),
+        verified: Boolean(codexCap),
         tierName: codexCap?.tierName,
         binaryPath: codexCliBin || codexBridgeJs,
         loginCommand: "codex login",
         statusMessage: codexCliBin
           ? `已接入适配器 (${path.basename(codexCliBin)} 已安装)`
           : "已内置适配器（需本地安装并在终端执行 codex login）",
-        models: codexCap?.models?.length
-          ? codexCap.models
-          : [
-              { value: "default", name: "Codex Default (Subscription)" },
-              { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-            ],
-        defaultModel: codexCap?.defaultModel || "default",
-        thoughtLevels: codexCap?.thoughtLevels ?? codexDefaultLevels,
-        defaultThoughtLevel: codexCap?.defaultThoughtLevel || "high",
+        models: codexModels,
+        defaultModel: codexCap?.defaultModel || codexModels[0]?.value || "",
+        thoughtLevels: codexCap?.thoughtLevels ?? [],
+        defaultThoughtLevel: codexCap?.defaultThoughtLevel || "",
         lastProbedAt: codexCap?.probedAt,
       },
     };

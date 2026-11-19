@@ -6,7 +6,7 @@ import { Readable, Writable } from "node:stream";
 import { getEncoding } from "js-tiktoken";
 import { spillIfOversized } from "../selective-io.js";
 import { describeToolCall } from "../permissions.js";
-import type { ProviderRegistry } from "./registry.js";
+import type { ProviderLaunchSpec, ProviderRegistry } from "./registry.js";
 import type {
   McpServerRecord,
   ProviderId,
@@ -87,6 +87,8 @@ export interface ExecuteAcpPulseInput {
   aventApiUrl: string;
   userMcpServers?: McpServerRecord[];
   providerId: ProviderId;
+  launchSpecOverride?: ProviderLaunchSpec;
+  isCompatibleEndpoint?: boolean;
   modelId: string;
   thoughtLevel: string;
   maxActions: number;
@@ -605,10 +607,15 @@ export async function executeAcpPulse(
     if (input.mockAgentApp) {
       return input.mockAgentApp;
     }
-    const spec = registry.getLaunchSpec(input.providerId);
+    const spec = input.launchSpecOverride ?? registry.getLaunchSpec(input.providerId);
+    const childEnv: Record<string, string | undefined> = { ...process.env };
+    for (const k of spec.unsetEnv ?? []) {
+      delete childEnv[k];
+    }
+    Object.assign(childEnv, spec.env);
     proc = spawn(spec.command, spec.args, {
       cwd: input.cwd,
-      env: { ...process.env, ...spec.env },
+      env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -687,50 +694,55 @@ export async function executeAcpPulse(
         const initModelOpt = activeConfigOptions.find(
           (o) => o.type === "select" && (o.id === "model" || o.category === "model")
         );
-        if (
-          registry.recordObservedConfigOptions(
-            input.providerId,
-            initModelOpt && initModelOpt.type === "select" ? initModelOpt.currentValue : undefined,
-            activeConfigOptions,
-            observedTier
-          )
-        ) {
-          capsChanged = true;
-        }
 
-        if (
-          initModelOpt &&
-          initModelOpt.type === "select" &&
-          input.modelId &&
-          input.modelId !== "default"
-        ) {
-          const flatValues = initModelOpt.options.flatMap((item) =>
-            "options" in item ? item.options.map((sub) => sub.value) : [item.value]
-          );
-          if (flatValues.includes(input.modelId)) {
-            const upd = await agent.request(acp.methods.agent.session.setConfigOption, {
-              sessionId: activeSessionId,
-              configId: initModelOpt.id,
-              value: input.modelId,
-            });
-            if (upd.configOptions && upd.configOptions.length > 0) {
-              activeConfigOptions = upd.configOptions;
-              if (
-                registry.recordObservedConfigOptions(
-                  input.providerId,
-                  input.modelId,
-                  activeConfigOptions,
-                  observedTier
-                )
-              ) {
-                capsChanged = true;
+        if (!input.isCompatibleEndpoint) {
+          if (
+            registry.recordObservedConfigOptions(
+              input.providerId,
+              initModelOpt && initModelOpt.type === "select"
+                ? initModelOpt.currentValue
+                : undefined,
+              activeConfigOptions,
+              observedTier
+            )
+          ) {
+            capsChanged = true;
+          }
+
+          if (
+            initModelOpt &&
+            initModelOpt.type === "select" &&
+            input.modelId &&
+            input.modelId !== "default"
+          ) {
+            const flatValues = initModelOpt.options.flatMap((item) =>
+              "options" in item ? item.options.map((sub) => sub.value) : [item.value]
+            );
+            if (flatValues.includes(input.modelId)) {
+              const upd = await agent.request(acp.methods.agent.session.setConfigOption, {
+                sessionId: activeSessionId,
+                configId: initModelOpt.id,
+                value: input.modelId,
+              });
+              if (upd.configOptions && upd.configOptions.length > 0) {
+                activeConfigOptions = upd.configOptions;
+                if (
+                  registry.recordObservedConfigOptions(
+                    input.providerId,
+                    input.modelId,
+                    activeConfigOptions,
+                    observedTier
+                  )
+                ) {
+                  capsChanged = true;
+                }
               }
             }
           }
-        }
 
-        if (capsChanged) {
-          input.onProvidersUpdated?.();
+          if (capsChanged) {
+            input.onProvidersUpdated?.();
+          }
         }
 
         const thoughtOpt = activeConfigOptions.find(
@@ -741,7 +753,12 @@ export async function executeAcpPulse(
               o.id === "reasoning_effort" ||
               o.id === "thinking_level")
         );
-        if (thoughtOpt && thoughtOpt.type === "select" && input.thoughtLevel) {
+        if (
+          thoughtOpt &&
+          thoughtOpt.type === "select" &&
+          input.thoughtLevel &&
+          input.thoughtLevel !== "off"
+        ) {
           const flatValues = thoughtOpt.options.flatMap((item) =>
             "options" in item ? item.options.map((sub) => sub.value) : [item.value]
           );

@@ -71,13 +71,49 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
     }
   });
 
-  it("registers agy, claude-agent-acp, and codex-acp subscription drivers", () => {
-    const registry = new ProviderRegistry(process.cwd());
-    const statuses = registry.listProviderStatuses();
-    assert.deepEqual(
-      statuses.map((s) => s.id),
-      ["agy", "claude", "codex"]
-    );
+  it("registers agy, claude-agent-acp, and codex-acp with zero hardcoded fallback models when unprobed, and supports editable compatible endpoints", () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-ep-"));
+    const store = new AventStore(path.join(tmpDir, ".avent"), tmpDir);
+    try {
+      const registry = new ProviderRegistry(process.cwd(), store);
+      const statuses = registry.listProviderStatuses();
+      assert.deepEqual(
+        statuses.map((s) => s.id),
+        ["agy", "claude", "codex"]
+      );
+      // Zero hardcoded fallback models or thought levels before live ACP probe!
+      for (const st of statuses) {
+        assert.deepEqual(st.models, []);
+        assert.deepEqual(st.thoughtLevels, []);
+      }
+
+      // Compatible endpoint inline CRUD + per-model thinkingMode + secret isolation
+      const ep = store.addCompatibleEndpoint({
+        name: "My Gateway",
+        protocol: "anthropic",
+        baseUrl: "https://gateway.example.com",
+        apiKey: "sk-secret-1234567890",
+        models: [{ id: "deepseek-chat", thinkingMode: "none" }],
+      });
+      assert.equal(ep.apiKeySet, true);
+      assert.equal(ep.apiKeyHint, "sk-s••••7890");
+      assert.equal("apiKey" in ep, false);
+
+      const updated = store.updateCompatibleEndpoint(ep.id, {
+        models: [
+          { id: "deepseek-chat", thinkingMode: "none" },
+          { id: "deepseek-reasoner", thinkingMode: "extended" },
+        ],
+      })!;
+      assert.equal(updated.models.length, 2);
+      assert.equal(updated.models[1].thinkingMode, "extended");
+
+      const secret = store.getCompatibleEndpointSecret(ep.id)!;
+      assert.equal(secret.apiKey, "sk-secret-1234567890");
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
   });
 
   it("evaluates allow/ask/deny permission rules in strict precedence order", () => {

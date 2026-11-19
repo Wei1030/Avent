@@ -15,6 +15,7 @@ export function AppShell() {
     tasks,
     approvals,
     providers,
+    endpoints,
     prefs,
     lang,
     t,
@@ -37,8 +38,12 @@ export function AppShell() {
   const [langOpen, setLangOpen] = useState(false);
   const langBtnRef = useRef<HTMLButtonElement>(null);
 
-  const defaultProvider =
-    providers.find((p) => p.id === prefs.defaultProviderId) ?? providers[0];
+  const defaultEndpoint = prefs.defaultProviderId.startsWith("endpoint:")
+    ? endpoints.find((ep) => `endpoint:${ep.id}` === prefs.defaultProviderId)
+    : undefined;
+  const defaultProvider = !defaultEndpoint
+    ? providers.find((p) => p.id === prefs.defaultProviderId) ?? providers[0]
+    : undefined;
 
   const runningTasksCount = tasks.filter(
     (tk) => tk.status === "PULSING" || tk.status === "WAITING_APPROVAL"
@@ -269,24 +274,31 @@ export function AppShell() {
           )}
         </Popover>
 
-        {/* Subscription Status Pill */}
-        {defaultProvider && (
+        {/* Subscription / Endpoint Status Pill */}
+        {(defaultEndpoint || defaultProvider) && (
           <div
             className="account"
             onClick={() => nav("/settings/provider")}
-            title="点击管理多厂商订阅与模型服务"
+            title="点击管理多厂商订阅与兼容端点"
           >
             <span
               className="avatar"
               style={{
-                background: defaultProvider.available ? "var(--accent)" : "var(--muted)",
+                background:
+                  defaultEndpoint || defaultProvider?.available
+                    ? "var(--accent)"
+                    : "var(--muted)",
               }}
             >
-              {defaultProvider.shortName.slice(0, 1)}
+              {(defaultEndpoint ? defaultEndpoint.name : defaultProvider!.shortName).slice(0, 1)}
             </span>
             <div className="lines">
-              <b>{defaultProvider.shortName}</b>
-              <span className="muted">{defaultProvider.subscriptionLabel}</span>
+              <b>{defaultEndpoint ? defaultEndpoint.name : defaultProvider!.shortName}</b>
+              <span className="muted">
+                {defaultEndpoint
+                  ? prefs.defaultModelId || "兼容端点"
+                  : defaultProvider!.subscriptionLabel}
+              </span>
             </div>
           </div>
         )}
@@ -319,12 +331,10 @@ export function AppShell() {
           <span>{t("用量")}</span>
         </NavLink>
 
-        <div className="bottom">
-          <NavLink to="/settings" className={({ isActive }) => cx(isActive && "active")}>
-            <Icon name="gear" size={19} />
-            <span>{t("设置")}</span>
-          </NavLink>
-        </div>
+        <NavLink to="/settings" className={({ isActive }) => cx(isActive && "active")}>
+          <Icon name="gear" size={19} />
+          <span>{t("设置")}</span>
+        </NavLink>
       </nav>
 
       {/* Main Content Area */}

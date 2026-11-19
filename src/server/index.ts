@@ -10,14 +10,17 @@ import { ProviderRegistry } from "./providers/registry.js";
 import { PulseEngine } from "./pulse-engine.js";
 import { probeMcpServer } from "./mcp-probe.js";
 import { boundedDocRead, searchPulseHistory, surgicalGrep } from "./selective-io.js";
-import type {
-  ApprovalDecisionPayload,
-  AttachmentItem,
-  PermissionMode,
-  ProviderId,
-  PulseMode,
-  TaskProviderId,
-  TaskRef,
+import {
+  thinkingModeToLevels,
+  type ApprovalDecisionPayload,
+  type AttachmentItem,
+  type CompatibleEndpointModel,
+  type EndpointProtocol,
+  type PermissionMode,
+  type ProviderId,
+  type PulseMode,
+  type TaskProviderId,
+  type TaskRef,
 } from "../shared/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -267,7 +270,7 @@ export function createAventApp(options?: {
       objective?: string;
       completionCriteria?: string[];
       cwd?: string;
-      providerId?: ProviderId;
+      providerId?: TaskProviderId;
       modelId?: string;
       thoughtLevel?: string;
       permissionMode?: PermissionMode;
@@ -278,8 +281,64 @@ export function createAventApp(options?: {
     }>();
 
     const prefs = store.getPreferences();
-    const providerId: ProviderId = body.providerId || prefs.defaultProviderId || "agy";
-    const spec = registry.getLaunchSpec(providerId);
+    let providerId: TaskProviderId = body.providerId || prefs.defaultProviderId || "agy";
+    let chosenModelId = body.modelId ?? "";
+    let chosenThoughtLevel = body.thoughtLevel ?? "";
+
+    if (providerId.startsWith("endpoint:")) {
+      const ep = store.getCompatibleEndpoint(providerId.slice("endpoint:".length));
+      if (ep) {
+        chosenModelId =
+          chosenModelId ||
+          (providerId === prefs.defaultProviderId ? prefs.defaultModelId : "") ||
+          ep.models[0]?.id ||
+          "";
+        const mMeta = ep.models.find((m) => m.id === chosenModelId);
+        const lvls = thinkingModeToLevels(mMeta?.thinkingMode ?? "none");
+        if (!chosenThoughtLevel) {
+          const prefLvl =
+            providerId === prefs.defaultProviderId ? prefs.defaultThoughtLevel : "";
+          chosenThoughtLevel =
+            lvls.length === 0
+              ? ""
+              : lvls.some((l) => l.value === prefLvl)
+                ? prefLvl
+                : lvls[lvls.length - 1].value;
+        }
+      } else {
+        providerId = "agy";
+      }
+    }
+
+    if (!providerId.startsWith("endpoint:")) {
+      const spec = registry.getLaunchSpec(providerId as ProviderId);
+      chosenModelId =
+        chosenModelId ||
+        (providerId === prefs.defaultProviderId &&
+        prefs.defaultModelId &&
+        spec.info.models.some((m) => m.value === prefs.defaultModelId)
+          ? prefs.defaultModelId
+          : "") ||
+        spec.info.defaultModel ||
+        spec.info.models[0]?.value ||
+        "";
+      const chosenModelMeta = spec.info.models.find((m) => m.value === chosenModelId);
+      const allowedLvls =
+        chosenModelMeta?.thoughtLevels !== undefined
+          ? chosenModelMeta.thoughtLevels
+          : spec.info.thoughtLevels;
+      if (allowedLvls.length === 0) {
+        chosenThoughtLevel = "";
+      } else if (!chosenThoughtLevel || !allowedLvls.some((l) => l.value === chosenThoughtLevel)) {
+        const prefLvl =
+          providerId === prefs.defaultProviderId ? prefs.defaultThoughtLevel : "";
+        chosenThoughtLevel =
+          (prefLvl && allowedLvls.some((l) => l.value === prefLvl) ? prefLvl : "") ||
+          chosenModelMeta?.defaultThoughtLevel ||
+          spec.info.defaultThoughtLevel ||
+          allowedLvls[0].value;
+      }
+    }
 
     let cwd = body.cwd?.trim() || "";
     if (!cwd && body.workspaceId) {
@@ -291,13 +350,6 @@ export function createAventApp(options?: {
 
     const objectiveText = (body.objective ?? "").trim();
     const isDraft = Boolean(body.draft) || objectiveText.length === 0;
-    const chosenModelId = body.modelId || spec.info.defaultModel;
-    const chosenModelMeta = spec.info.models.find((m) => m.value === chosenModelId);
-    const chosenThoughtLevel =
-      body.thoughtLevel ??
-      (chosenModelMeta?.thoughtLevels?.length === 0
-        ? ""
-        : chosenModelMeta?.defaultThoughtLevel || spec.info.defaultThoughtLevel);
 
     const task = store.createTask({
       workspaceId: body.workspaceId,
@@ -362,7 +414,25 @@ export function createAventApp(options?: {
     let nextThought = body.thoughtLevel;
     const targetProvider = body.providerId ?? task.providerId;
 
-    if (!targetProvider.startsWith("endpoint:")) {
+    if (targetProvider.startsWith("endpoint:")) {
+      const ep = store.getCompatibleEndpoint(targetProvider.slice("endpoint:".length));
+      if (ep) {
+        if (body.providerId && body.providerId !== task.providerId && !nextModel) {
+          nextModel = ep.models[0]?.id || "";
+        }
+        const effModel = nextModel ?? task.modelId;
+        const mMeta = ep.models.find((m) => m.id === effModel);
+        const allowedLevels = thinkingModeToLevels(mMeta?.thinkingMode ?? "none");
+        if (allowedLevels.length === 0) {
+          nextThought = "";
+        } else {
+          const candidateThought = nextThought ?? task.thoughtLevel;
+          if (!allowedLevels.some((lv) => lv.value === candidateThought)) {
+            nextThought = allowedLevels[allowedLevels.length - 1].value;
+          }
+        }
+      }
+    } else {
       const spec = registry.getLaunchSpec(targetProvider as ProviderId);
       if (body.providerId && body.providerId !== task.providerId && !nextModel) {
         nextModel = spec.info.defaultModel;
@@ -698,21 +768,93 @@ export function createAventApp(options?: {
 
   app.post("/api/endpoints", async (c) => {
     const body = await c.req.json<{
-      name: string;
-      baseUrl: string;
+      name?: string;
+      protocol?: EndpointProtocol;
+      baseUrl?: string;
       apiKey?: string;
-      models: string[];
+      models?: Array<CompatibleEndpointModel | string>;
     }>();
-    if (!body.name?.trim() || !body.baseUrl?.trim()) {
-      return c.json({ error: "名称与接口地址不能为空" }, 400);
-    }
     const endpoint = store.addCompatibleEndpoint(body);
-    return c.json({ endpoint }, 201);
+    const endpoints = store.listCompatibleEndpoints();
+    engine.broadcast({ type: "endpoints_updated", endpoints });
+    return c.json({ endpoint, endpoints }, 201);
+  });
+
+  app.patch("/api/endpoints/:id", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json<{
+      name?: string;
+      protocol?: EndpointProtocol;
+      baseUrl?: string;
+      apiKey?: string | null;
+      models?: CompatibleEndpointModel[];
+      enabled?: boolean;
+    }>();
+    const endpoint = store.updateCompatibleEndpoint(id, body);
+    if (!endpoint) return c.json({ error: "端点不存在" }, 404);
+    const endpoints = store.listCompatibleEndpoints();
+    engine.broadcast({ type: "endpoints_updated", endpoints });
+    return c.json({ endpoint, endpoints });
+  });
+
+  app.post("/api/endpoints/:id/fetch-models", async (c) => {
+    const id = c.req.param("id");
+    const ep = store.getCompatibleEndpointSecret(id);
+    if (!ep) return c.json({ error: "端点不存在" }, 404);
+    const base = ep.record.baseUrl.trim().replace(/\/+$/, "");
+    if (!base) return c.json({ error: "请先填写 Base URL" }, 400);
+
+    const candidateUrls = base.endsWith("/v1")
+      ? [`${base}/models`]
+      : [`${base}/v1/models`, `${base}/models`];
+
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (ep.apiKey) {
+      if (ep.record.protocol === "anthropic") {
+        headers["x-api-key"] = ep.apiKey;
+        headers["anthropic-version"] = "2023-06-01";
+        headers["Authorization"] = `Bearer ${ep.apiKey}`;
+      } else {
+        headers["Authorization"] = `Bearer ${ep.apiKey}`;
+      }
+    }
+
+    let lastErr = "无法连接到 /models 接口";
+    for (const url of candidateUrls) {
+      try {
+        const res = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) {
+          lastErr = `HTTP ${res.status} (${url})`;
+          continue;
+        }
+        const json = (await res.json()) as {
+          data?: Array<{ id?: string; display_name?: string }>;
+          models?: Array<{ id?: string; name?: string }>;
+        };
+        const rawList = Array.isArray(json.data)
+          ? json.data
+          : Array.isArray(json.models)
+            ? json.models
+            : [];
+        const modelIds = rawList
+          .map((item) => String(item.id ?? (item as { name?: string }).name ?? "").trim())
+          .filter(Boolean);
+        return c.json({ ok: true, models: [...new Set(modelIds)] });
+      } catch (err) {
+        lastErr = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return c.json({ ok: false, models: [], error: lastErr }, 400);
   });
 
   app.delete("/api/endpoints/:id", (c) => {
     store.deleteCompatibleEndpoint(c.req.param("id"));
-    return c.json({ ok: true });
+    const endpoints = store.listCompatibleEndpoints();
+    engine.broadcast({ type: "endpoints_updated", endpoints });
+    return c.json({ ok: true, endpoints });
   });
 
   // --- SSE Real-Time Stream ---

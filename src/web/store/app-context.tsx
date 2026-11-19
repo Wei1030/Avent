@@ -70,10 +70,10 @@ interface AppContextValue {
 const DEFAULT_PREFS: AppPreferences = {
   uiLanguage: "auto",
   defaultProviderId: "agy",
+  defaultModelId: "",
+  defaultThoughtLevel: "",
   defaultPermissionMode: "acceptEdits",
-  autoVerifyEdits: true,
   desktopNotifications: true,
-  maxAutoContinues: 10,
 };
 
 const AppCtx = createContext<AppContextValue | null>(null);
@@ -194,6 +194,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
         case "providers_updated":
           setProviders(ev.providers);
+          break;
+
+        case "endpoints_updated":
+          setEndpoints(ev.endpoints);
           break;
 
         case "task_updated": {

@@ -367,36 +367,12 @@ export class PulseEngine {
 
     const { taskTitle: _tt, taskObjective: _to, newDirectives: _nd, ...stateFields } = draft;
 
-    const prefs = this.store.getPreferences();
-    const hasUnverifiedEdits =
-      prefs.autoVerifyEdits &&
-      stateFields.appliedChanges.length > 0 &&
-      stateFields.appliedChanges.some((c) => !c.verified) &&
-      stateFields.verificationChecks.length === 0;
-
-    let adjustedDraft = stateFields;
-    let message = "Handoff recorded cleanly.";
-    if (stateFields.status === "COMPLETED" && hasUnverifiedEdits) {
-      adjustedDraft = {
-        ...stateFields,
-        status: "CONTINUE",
-        remainingPlan: [
-          "运行构建或测试验证刚刚完成的修改，确认无误后再标记已完成",
-          ...stateFields.remainingPlan,
-        ],
-        immediateNextAction:
-          stateFields.immediateNextAction || "对已修改的文件执行测试或类型检查验证",
-      };
-      message =
-        "Note: Unverified file changes detected without verificationChecks; downgraded status to CONTINUE so the next round verifies changes.";
-    }
-
     const saved = this.store.commitSemanticState(
       ctx.taskId,
       ctx.pulseNumber,
       task.providerId,
       task.modelId,
-      adjustedDraft
+      stateFields
     );
     ctx.committedState = saved;
 
@@ -404,7 +380,7 @@ export class PulseEngine {
     const updatedTask = this.decorateTask(this.store.getTask(ctx.taskId))!;
     this.broadcast({ type: "task_updated", task: updatedTask });
 
-    return { version: saved.version, message };
+    return { version: saved.version, message: "Handoff recorded cleanly." };
   }
 
   public triggerEvent(taskId: string, event: AventEvent): void {
@@ -418,9 +394,10 @@ export class PulseEngine {
   private async runPulseLoop(taskId: string, initialEvent: AventEvent): Promise<void> {
     let currentEvent: AventEvent | undefined = initialEvent;
     let burstCount = 0;
-    const maxContinues = Math.max(1, this.store.getPreferences().maxAutoContinues || 10);
+    // Silent high internal safety circuit-breaker (avoids runaway infinite loops on broken tools)
+    const INTERNAL_SAFETY_CAP = 50;
 
-    while (currentEvent && burstCount < maxContinues) {
+    while (currentEvent && burstCount < INTERNAL_SAFETY_CAP) {
       burstCount += 1;
       const task = this.store.getTask(taskId);
       if (!task) return;
@@ -493,11 +470,34 @@ export class PulseEngine {
       };
 
       try {
+        let acpProviderId: ProviderId;
+        let launchSpecOverride;
+        let isCompatibleEndpoint = false;
+
         if (refreshedTask.providerId.startsWith("endpoint:")) {
-          throw new Error(
-            "当前兼容端点仅保存了模型配置，暂未绑定 ACP 执行驱动；请在底部模型选择器切换至 Google Antigravity / Claude Code / Codex 订阅执行。"
-          );
+          const epId = refreshedTask.providerId.slice("endpoint:".length);
+          const epSecret = this.store.getCompatibleEndpointSecret(epId);
+          if (!epSecret) {
+            throw new Error("所选兼容端点不存在或已被删除，请重新选择模型。");
+          }
+          if (!epSecret.record.baseUrl.trim()) {
+            throw new Error(`兼容端点「${epSecret.record.name}」尚未配置 Base URL。`);
+          }
+          const epModel = epSecret.record.models.find((m) => m.id === refreshedTask.modelId);
+          launchSpecOverride = this.registry.getEndpointLaunchSpec({
+            protocol: epSecret.record.protocol,
+            baseUrl: epSecret.record.baseUrl,
+            apiKey: epSecret.apiKey,
+            modelId: refreshedTask.modelId,
+            thinkingMode: epModel?.thinkingMode ?? "none",
+            thoughtLevel: refreshedTask.thoughtLevel,
+          });
+          acpProviderId = launchSpecOverride.id;
+          isCompatibleEndpoint = true;
+        } else {
+          acpProviderId = refreshedTask.providerId as ProviderId;
         }
+
         const userMcpServers = this.store.listMcpServers(refreshedTask.workspaceId);
 
         const result = await executeAcpPulse(this.registry, {
@@ -509,7 +509,9 @@ export class PulseEngine {
           mcpBundlePath: this.mcpBundlePath,
           aventApiUrl: this.aventApiUrl,
           userMcpServers,
-          providerId: refreshedTask.providerId as ProviderId,
+          providerId: acpProviderId,
+          launchSpecOverride,
+          isCompatibleEndpoint,
           modelId: refreshedTask.modelId,
           thoughtLevel: refreshedTask.thoughtLevel,
           maxActions: budget.maxActions,

@@ -16,7 +16,9 @@ import type {
   AppPreferences,
   AventEvent,
   AventEventType,
+  CompatibleEndpointModel,
   CompatibleEndpointRecord,
+  EndpointProtocol,
   InstructionDoc,
   McpServerRecord,
   McpToolSummary,
@@ -43,10 +45,10 @@ import type {
 const DEFAULT_PREFS: AppPreferences = {
   uiLanguage: "auto",
   defaultProviderId: "agy",
+  defaultModelId: "",
+  defaultThoughtLevel: "",
   defaultPermissionMode: "acceptEdits",
-  autoVerifyEdits: true,
   desktopNotifications: true,
-  maxAutoContinues: 10,
 };
 
 const BUILTIN_SKILLS: SkillRecord[] = [
@@ -254,7 +256,9 @@ export class AventStore {
       CREATE TABLE IF NOT EXISTS compatible_endpoints (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
+        protocol TEXT NOT NULL DEFAULT 'anthropic',
         base_url TEXT NOT NULL,
+        api_key TEXT NOT NULL DEFAULT '',
         api_key_hint TEXT NOT NULL,
         models_json TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
@@ -286,6 +290,21 @@ export class AventStore {
     }
     if (!colNames.has("objective_source")) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN objective_source TEXT NOT NULL DEFAULT 'auto';`);
+    }
+
+    const epCols = this.db
+      .prepare(`PRAGMA table_info(compatible_endpoints)`)
+      .all() as Array<{ name: string }>;
+    const epColNames = new Set(epCols.map((c) => c.name));
+    if (!epColNames.has("protocol")) {
+      this.db.exec(
+        `ALTER TABLE compatible_endpoints ADD COLUMN protocol TEXT NOT NULL DEFAULT 'anthropic';`
+      );
+    }
+    if (!epColNames.has("api_key")) {
+      this.db.exec(
+        `ALTER TABLE compatible_endpoints ADD COLUMN api_key TEXT NOT NULL DEFAULT '';`
+      );
     }
 
     // Seed default safety permission rules once if empty
@@ -1867,46 +1886,146 @@ export class AventStore {
     return out;
   }
 
+  private normalizeEndpointModels(rawJson: string): CompatibleEndpointModel[] {
+    try {
+      const parsed = JSON.parse(rawJson) as unknown[];
+      if (!Array.isArray(parsed)) return [];
+      const out: CompatibleEndpointModel[] = [];
+      for (const item of parsed) {
+        if (typeof item === "string" && item.trim()) {
+          out.push({ id: item.trim(), thinkingMode: "none" });
+        } else if (item && typeof item === "object") {
+          const obj = item as Record<string, unknown>;
+          const id = String(obj.id ?? obj.name ?? "").trim();
+          if (!id) continue;
+          const tm = String(obj.thinkingMode ?? "none");
+          const validTm =
+            tm === "toggle" || tm === "standard" || tm === "extended" ? tm : "none";
+          out.push({
+            id,
+            name: typeof obj.name === "string" && obj.name.trim() ? obj.name.trim() : undefined,
+            thinkingMode: validTm,
+          });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  private mapEndpointRow(r: Record<string, unknown>): CompatibleEndpointRecord {
+    const rawKey = String(r.api_key ?? "");
+    const hint = String(r.api_key_hint ?? "");
+    return {
+      id: String(r.id),
+      name: String(r.name),
+      protocol: (r.protocol === "openai" ? "openai" : "anthropic") as EndpointProtocol,
+      baseUrl: String(r.base_url),
+      apiKeySet: rawKey.length > 0 || (hint.length > 0 && hint !== "未设置"),
+      apiKeyHint: hint || "未设置",
+      models: this.normalizeEndpointModels(String(r.models_json ?? "[]")),
+      enabled: Number(r.enabled) === 1,
+      createdAt: String(r.created_at),
+    };
+  }
+
   public listCompatibleEndpoints(): CompatibleEndpointRecord[] {
     const rows = this.db
       .prepare(`SELECT * FROM compatible_endpoints ORDER BY created_at DESC`)
       .all() as Record<string, unknown>[];
-    return rows.map((r) => ({
-      id: String(r.id),
-      name: String(r.name),
-      baseUrl: String(r.base_url),
-      apiKeyHint: String(r.api_key_hint),
-      models: JSON.parse(String(r.models_json)) as string[],
-      enabled: Number(r.enabled) === 1,
-      createdAt: String(r.created_at),
-    }));
+    return rows.map((r) => this.mapEndpointRow(r));
+  }
+
+  public getCompatibleEndpoint(id: string): CompatibleEndpointRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM compatible_endpoints WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapEndpointRow(row) : null;
+  }
+
+  public getCompatibleEndpointSecret(
+    id: string
+  ): { record: CompatibleEndpointRecord; apiKey: string } | null {
+    const row = this.db
+      .prepare(`SELECT * FROM compatible_endpoints WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      record: this.mapEndpointRow(row),
+      apiKey: String(row.api_key ?? ""),
+    };
   }
 
   public addCompatibleEndpoint(input: {
-    name: string;
-    baseUrl: string;
+    name?: string;
+    protocol?: EndpointProtocol;
+    baseUrl?: string;
     apiKey?: string;
-    models: string[];
+    models?: Array<CompatibleEndpointModel | string>;
   }): CompatibleEndpointRecord {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
+    const name = (input.name ?? "").trim() || "新兼容端点";
+    const protocol: EndpointProtocol = input.protocol === "openai" ? "openai" : "anthropic";
+    const baseUrl = (input.baseUrl ?? "").trim();
     const key = (input.apiKey ?? "").trim();
-    const hint = key.length > 8 ? `${key.slice(0, 4)}••••${key.slice(-4)}` : key ? "已设置" : "未设置";
+    const hint =
+      key.length > 8 ? `${key.slice(0, 4)}••••${key.slice(-4)}` : key ? "已设置" : "未设置";
+    const models = this.normalizeEndpointModels(JSON.stringify(input.models ?? []));
+
     this.db
       .prepare(
-        `INSERT INTO compatible_endpoints (id, name, base_url, api_key_hint, models_json, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?)`
+        `INSERT INTO compatible_endpoints (id, name, protocol, base_url, api_key, api_key_hint, models_json, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`
       )
-      .run(id, input.name.trim(), input.baseUrl.trim(), hint, JSON.stringify(input.models), now);
-    return {
-      id,
-      name: input.name.trim(),
-      baseUrl: input.baseUrl.trim(),
-      apiKeyHint: hint,
-      models: input.models,
-      enabled: true,
-      createdAt: now,
-    };
+      .run(id, name, protocol, baseUrl, key, hint, JSON.stringify(models), now);
+    return this.getCompatibleEndpoint(id)!;
+  }
+
+  public updateCompatibleEndpoint(
+    id: string,
+    patch: {
+      name?: string;
+      protocol?: EndpointProtocol;
+      baseUrl?: string;
+      apiKey?: string | null;
+      models?: CompatibleEndpointModel[];
+      enabled?: boolean;
+    }
+  ): CompatibleEndpointRecord | null {
+    const existing = this.getCompatibleEndpointSecret(id);
+    if (!existing) return null;
+
+    const nextName = patch.name !== undefined ? patch.name.trim() || existing.record.name : existing.record.name;
+    const nextProto: EndpointProtocol =
+      patch.protocol === "openai" || patch.protocol === "anthropic"
+        ? patch.protocol
+        : existing.record.protocol;
+    const nextUrl = patch.baseUrl !== undefined ? patch.baseUrl.trim() : existing.record.baseUrl;
+    const nextModels =
+      patch.models !== undefined
+        ? this.normalizeEndpointModels(JSON.stringify(patch.models))
+        : existing.record.models;
+    const nextEnabled = patch.enabled !== undefined ? (patch.enabled ? 1 : 0) : existing.record.enabled ? 1 : 0;
+
+    let nextKey = existing.apiKey;
+    let nextHint = existing.record.apiKeyHint;
+    if (patch.apiKey !== undefined) {
+      const k = (patch.apiKey ?? "").trim();
+      nextKey = k;
+      nextHint = k.length > 8 ? `${k.slice(0, 4)}••••${k.slice(-4)}` : k ? "已设置" : "未设置";
+    }
+
+    this.db
+      .prepare(
+        `UPDATE compatible_endpoints
+         SET name = ?, protocol = ?, base_url = ?, api_key = ?, api_key_hint = ?, models_json = ?, enabled = ?
+         WHERE id = ?`
+      )
+      .run(nextName, nextProto, nextUrl, nextKey, nextHint, JSON.stringify(nextModels), nextEnabled, id);
+
+    return this.getCompatibleEndpoint(id);
   }
 
   public deleteCompatibleEndpoint(id: string): void {

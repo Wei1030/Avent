@@ -175,6 +175,15 @@ export type TranscriptItem =
       createdAt: string;
     };
 
+export type ToolCategory = "read" | "edit" | "delete" | "shell" | "other";
+
+export interface ShellSubCommandPreview {
+  raw: string;
+  executable: string;
+  classification: "read_only" | "write_or_unknown" | "destructive";
+  reasons: string[];
+}
+
 export interface ApprovalRequest {
   id: string;
   taskId: string;
@@ -182,11 +191,35 @@ export interface ApprovalRequest {
   workspaceId: string;
   toolCallId: string;
   toolName: string;
+  category?: ToolCategory;
   detail: string;
   rawInput?: unknown;
   risky: boolean;
+  outsideWorkspace?: boolean;
+  reasons?: string[];
+  subCommands?: ShellSubCommandPreview[];
   suggestedRule: string;
   createdAt: string;
+}
+
+export interface PermissionEvaluationPreview {
+  action: "allow" | "ask" | "deny";
+  provenance: string;
+  toolName: string;
+  category: ToolCategory;
+  isReadOnly: boolean;
+  isRisky: boolean;
+  outsideWorkspace: boolean;
+  reasons: string[];
+  suggestedRule: string;
+  hazards: {
+    hasCompound: boolean;
+    hasRedirection: boolean;
+    hasCommandSub: boolean;
+    hasDynamicEval: boolean;
+    hasPipeToShell: boolean;
+  };
+  subCommands: ShellSubCommandPreview[];
 }
 
 export interface ApprovalDecisionPayload {

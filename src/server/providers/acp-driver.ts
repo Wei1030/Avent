@@ -6,6 +6,7 @@ import { Readable, Writable } from "node:stream";
 import { getEncoding } from "js-tiktoken";
 import { spillIfOversized } from "../selective-io.js";
 import { describeToolCall } from "../permissions.js";
+import { isPathInsideRoot, resolveCanonicalPath } from "../shell-parser.js";
 import type { ProviderLaunchSpec, ProviderRegistry } from "./registry.js";
 import type {
   McpServerRecord,
@@ -68,6 +69,7 @@ export interface ToolPermissionCheckInput {
   toolCallId: string;
   rawName: string;
   rawTitle: string;
+  rawKind?: string | null;
   rawInput?: unknown;
 }
 
@@ -242,11 +244,17 @@ export async function executeAcpPulse(
     });
   };
 
+  // Track tool operations already authorized via `session/request_permission` so secondary
+  // fallback gates on `fs/write_text_file` & `terminal/create` never double-prompt.
+  const approvedWritePaths = new Set<string>();
+  const approvedCommands = new Set<string>();
+
   const clientApp = acp
     .client({ name: "avent-runtime" })
     .onRequest(acp.methods.client.session.requestPermission, async (ctx) => {
       const rawName = ctx.params.toolCall.name || "";
       const rawTitle = ctx.params.toolCall.title || "";
+      const rawKind = ctx.params.toolCall.kind ?? null;
       const toolLabel = `${rawName} ${rawTitle}`.trim();
       const toolId = ctx.params.toolCall.toolCallId;
 
@@ -285,7 +293,11 @@ export async function executeAcpPulse(
         return selectReject();
       }
 
-      const desc = describeToolCall(rawName, rawTitle, ctx.params.toolCall.rawInput);
+      const desc = describeToolCall(rawName, rawTitle, ctx.params.toolCall.rawInput, {
+        rawKind,
+        cwd: input.cwd,
+        allowedReadRoots: [input.spillsDir],
+      });
       toolMetaById.set(toolId, {
         tool: desc.toolName,
         detail: desc.displayDetail,
@@ -297,6 +309,7 @@ export async function executeAcpPulse(
           toolCallId: toolId,
           rawName,
           rawTitle,
+          rawKind,
           rawInput: ctx.params.toolCall.rawInput,
         });
         if (!decision.allowed) {
@@ -311,6 +324,15 @@ export async function executeAcpPulse(
           });
           trace("permission", `已拒绝工具调用: ${desc.toolName} ${desc.displayDetail}`);
           return selectReject();
+        }
+        if ((desc.category === "edit" || desc.category === "delete") && desc.filePath) {
+          const absP = path.isAbsolute(desc.filePath)
+            ? desc.filePath
+            : path.resolve(input.cwd, desc.filePath);
+          approvedWritePaths.add(resolveCanonicalPath(absP).toLowerCase());
+        }
+        if (desc.category === "shell" && desc.specifier) {
+          approvedCommands.add(desc.specifier.trim());
         }
         toolMetaById.set(toolId, {
           tool: desc.toolName,
@@ -345,6 +367,28 @@ export async function executeAcpPulse(
       const targetPath = path.isAbsolute(ctx.params.path)
         ? ctx.params.path
         : path.resolve(input.cwd, ctx.params.path);
+
+      // Secondary boundary gate: reading files outside task.cwd (and outside Avent spillsDir) requires permission
+      const withinReadBounds =
+        isPathInsideRoot(targetPath, input.cwd) ||
+        isPathInsideRoot(targetPath, input.spillsDir);
+      if (!withinReadBounds && input.onCheckPermission) {
+        const decision = await input.onCheckPermission({
+          toolCallId: `fsread:${Date.now()}`,
+          rawName: "Read",
+          rawTitle: targetPath,
+          rawKind: "read",
+          rawInput: { file_path: targetPath },
+        });
+        if (!decision.allowed) {
+          trace("permission", `已拒绝越界读取文件: ${targetPath}`);
+          throw acp.RequestError.invalidParams(
+            undefined,
+            decision.denialMessage || `Permission denied: ${decision.provenance || "read outside workspace rejected"}`
+          );
+        }
+      }
+
       if (!existsSync(targetPath)) {
         throw new Error(`File not found: ${targetPath}`);
       }
@@ -371,6 +415,30 @@ export async function executeAcpPulse(
       const targetPath = path.isAbsolute(ctx.params.path)
         ? ctx.params.path
         : path.resolve(input.cwd, ctx.params.path);
+      const canonKey = resolveCanonicalPath(targetPath).toLowerCase();
+
+      // Secondary fallback permission gate (catches ACP agents calling fs/write_text_file without prior request_permission)
+      if (input.onCheckPermission) {
+        if (approvedWritePaths.has(canonKey)) {
+          approvedWritePaths.delete(canonKey);
+        } else {
+          const decision = await input.onCheckPermission({
+            toolCallId: `fswrite_perm:${Date.now()}`,
+            rawName: "Write",
+            rawTitle: targetPath,
+            rawKind: "edit",
+            rawInput: { file_path: targetPath },
+          });
+          if (!decision.allowed) {
+            trace("permission", `已拒绝直接写入文件: ${targetPath}`);
+            throw acp.RequestError.invalidParams(
+              undefined,
+              decision.denialMessage || `Permission denied: ${decision.provenance || "write rejected"}`
+            );
+          }
+        }
+      }
+
       const before = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
       mkdirSync(path.dirname(targetPath), { recursive: true });
       writeFileSync(targetPath, ctx.params.content, "utf8");
@@ -396,6 +464,32 @@ export async function executeAcpPulse(
     .onRequest(acp.methods.client.terminal.create, async (ctx) => {
       const termId = `term_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const termCwd = ctx.params.cwd || input.cwd;
+      const fullCmd = [ctx.params.command, ...(ctx.params.args ?? [])].join(" ").trim();
+      const termCwdOutside = !isPathInsideRoot(termCwd, input.cwd);
+
+      // Secondary fallback permission gate for direct terminal/create calls
+      if (input.onCheckPermission) {
+        if (!termCwdOutside && fullCmd && approvedCommands.has(fullCmd)) {
+          approvedCommands.delete(fullCmd);
+        } else {
+          const checkCmd = termCwdOutside ? `cd "${termCwd}" && ${fullCmd}` : fullCmd;
+          const decision = await input.onCheckPermission({
+            toolCallId: `term_perm:${termId}`,
+            rawName: "Bash",
+            rawTitle: checkCmd,
+            rawKind: "execute",
+            rawInput: { command: checkCmd },
+          });
+          if (!decision.allowed) {
+            trace("permission", `已拒绝终端命令执行: ${checkCmd}`);
+            throw acp.RequestError.invalidParams(
+              undefined,
+              decision.denialMessage || `Permission denied: ${decision.provenance || "terminal command rejected"}`
+            );
+          }
+        }
+      }
+
       const byteLimit = ctx.params.outputByteLimit ?? 64 * 1024;
       const envObj: Record<string, string> = { ...(process.env as Record<string, string>) };
       for (const pair of ctx.params.env ?? []) {
@@ -521,7 +615,11 @@ export async function executeAcpPulse(
             actionCount += 1;
             trace("tool", `调用工具 #${actionCount}: ${label || u.toolCallId}`);
           }
-          const desc = describeToolCall(rawName, rawTitle, u.rawInput);
+          const desc = describeToolCall(rawName, rawTitle, u.rawInput, {
+            rawKind: u.kind ?? null,
+            cwd: input.cwd,
+            allowedReadRoots: [input.spillsDir],
+          });
           const prev = toolMetaById.get(u.toolCallId);
           toolMetaById.set(u.toolCallId, {
             tool: prev?.tool || desc.toolName,

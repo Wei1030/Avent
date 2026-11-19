@@ -6,9 +6,11 @@ import type {
   EndpointProtocol,
   EndpointThinkingMode,
   InstructionDoc,
+  PermissionEvaluationPreview,
   PermissionMode,
   PermissionRuleRecord,
   ProviderId,
+  ToolCategory,
 } from "../../shared/types.js";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
@@ -172,13 +174,56 @@ function GeneralSettings() {
   );
 }
 
+const TESTER_CATEGORY_LABEL: Record<ToolCategory, string> = {
+  read: "只读工具",
+  edit: "文件编辑",
+  delete: "文件删除 / 移动",
+  shell: "终端命令",
+  other: "外部工具",
+};
+
+const TESTER_PRESETS: Array<{
+  label: string;
+  toolKind: "shell" | "edit" | "delete" | "read";
+  inputText: string;
+}> = [
+  { label: "纯只读拼接", toolKind: "shell", inputText: "git status && git diff --stat" },
+  { label: "测试+删文件绕过", toolKind: "shell", inputText: "npm.cmd test && rm -r -f src" },
+  { label: "重定向写文件", toolKind: "shell", inputText: "git diff > src/hacked.ts" },
+  { label: "PowerShell 递归删", toolKind: "shell", inputText: "Remove-Item -Recurse -Force dist" },
+  { label: "目录逃逸编辑", toolKind: "edit", inputText: "../../outside-secret.txt" },
+  { label: "工作区内删除文件", toolKind: "delete", inputText: "src/old.ts" },
+];
+
 function PermissionsSettings() {
-  const { activeWorkspace, toast, t } = useApp();
+  const { activeWorkspace, prefs, toast, t } = useApp();
   const [rules, setRules] = useState<PermissionRuleRecord[]>([]);
   const [behavior, setBehavior] = useState<"allow" | "ask" | "deny">("allow");
-  const [scope, setScope] = useState<"workspace" | "global">("workspace");
+  const [scope, setScope] = useState<"workspace" | "global">(() =>
+    activeWorkspace ? "workspace" : "global"
+  );
   const [pattern, setPattern] = useState("");
   const [note, setNote] = useState("");
+
+  // Live permission simulator state
+  const [testKind, setTestKind] = useState<"shell" | "edit" | "delete" | "read">("shell");
+  const [testMode, setTestMode] = useState<PermissionMode>(prefs.defaultPermissionMode);
+  const [testInput, setTestInput] = useState("npm.cmd test && rm -r -f src");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    preview: PermissionEvaluationPreview;
+    cwd: string;
+  } | null>(null);
+
+  useEffect(() => {
+    setTestMode(prefs.defaultPermissionMode);
+  }, [prefs.defaultPermissionMode]);
+
+  useEffect(() => {
+    if (!activeWorkspace && scope === "workspace") {
+      setScope("global");
+    }
+  }, [activeWorkspace, scope]);
 
   const load = async () => {
     const res = await api.listRules(activeWorkspace?.id);
@@ -188,6 +233,28 @@ function PermissionsSettings() {
   useEffect(() => {
     void load();
   }, [activeWorkspace?.id]);
+
+  const runEvaluate = async (
+    nextKind = testKind,
+    nextInput = testInput,
+    nextMode = testMode
+  ) => {
+    if (!nextInput.trim()) return;
+    setTesting(true);
+    try {
+      const res = await api.evaluateRule({
+        toolKind: nextKind,
+        inputText: nextInput,
+        mode: nextMode,
+        workspaceId: activeWorkspace?.id,
+      });
+      setTestResult(res);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const handleAdd = async () => {
     if (!pattern.trim()) return;
@@ -203,75 +270,110 @@ function PermissionsSettings() {
       setNote("");
       await load();
       toast("已添加权限规则", "good");
+      if (testResult && testInput.trim()) {
+        void runEvaluate();
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     }
+  };
+
+  const handleDeleteRule = async (id: string) => {
+    try {
+      await api.deleteRule(id);
+      await load();
+      toast("已删除权限规则", "good");
+      if (testResult && testInput.trim()) {
+        void runEvaluate();
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const fillExample = (b: "allow" | "ask" | "deny", expr: string, sampleNote: string) => {
+    setBehavior(b);
+    setPattern(expr);
+    setNote(sampleNote);
   };
 
   return (
     <>
       <h1>{t("权限")}</h1>
       <p className="lead">
-        控制智能体执行命令行、修改文件或调用外部工具时的审批行为。规则按以下优先级从左到右依次判定：
+        采用「结构化分类 + 目录边界锁 + Shell 词法拆解（Fail-Closed）」机制。任何无法确定证明为纯只读的命令，默认均需确认或命中显式规则：
       </p>
 
       <div className="eval-strip">
         <div className="eval-step deny">
           <b>1. 拒绝规则</b>
-          <span>命中立即拦截</span>
+          <span>任意子命令命中即拦截</span>
         </div>
         <Icon name="chevRight" size={14} className="muted" />
         <div className="eval-step">
           <b>2. 询问规则</b>
-          <span>强制弹窗确认</span>
+          <span>命中强制弹窗确认</span>
+        </div>
+        <Icon name="chevRight" size={14} className="muted" />
+        <div className="eval-step deny">
+          <b>3. 安全底线</b>
+          <span>越界 / 删文件 / 高危强拦</span>
         </div>
         <Icon name="chevRight" size={14} className="muted" />
         <div className="eval-step">
-          <b>3. 允许规则</b>
-          <span>命中自动放行</span>
+          <b>4. 拆解校验</b>
+          <span>允许规则 & 纯只读逐条过</span>
         </div>
         <Icon name="chevRight" size={14} className="muted" />
         <div className="eval-step you">
-          <b>4. 任务权限模式</b>
-          <span>默认询问 / 自动编辑</span>
+          <b>5. 权限模式</b>
+          <span>默认询问 / 自动编辑 / 全自动</span>
         </div>
       </div>
 
+      {/* Rules List & Editor */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-head">
           <h3>权限规则列表 ({rules.length})</h3>
+          <span className="sub">
+            {activeWorkspace ? `当前包含全局规则与「${activeWorkspace.name}」工作区规则` : "当前显示全局规则"}
+          </span>
         </div>
         <div>
-          {rules.map((r) => (
-            <div key={r.id} className="rule-row">
-              <Status
-                tone={
-                  r.behavior === "allow"
-                    ? "good"
-                    : r.behavior === "deny"
-                      ? "crit"
-                      : "warn"
-                }
-              >
-                {r.behavior === "allow" ? "允许" : r.behavior === "deny" ? "拒绝" : "询问"}
-              </Status>
-              <code className="mono" style={{ fontWeight: 600 }}>
-                {r.rule}
-              </code>
-              <Chip>{r.scope === "global" ? "全局" : "当前工作区"}</Chip>
-              {r.note && <span className="muted truncate">{r.note}</span>}
-              <span className="grow" />
-              <Button
-                variant="ghost"
-                size="sm"
-                icon="trash"
-                onClick={async () => {
-                  await api.deleteRule(r.id);
-                  await load();
-                }}
-              />
+          {rules.length === 0 ? (
+            <div className="empty" style={{ padding: "22px 16px" }}>
+              暂无自定义权限规则，全部按内置安全底线与任务权限模式判定。
             </div>
-          ))}
+          ) : (
+            rules.map((r) => (
+              <div key={r.id} className="rule-row">
+                <Status
+                  tone={
+                    r.behavior === "allow"
+                      ? "good"
+                      : r.behavior === "deny"
+                        ? "crit"
+                        : "warn"
+                  }
+                >
+                  {r.behavior === "allow" ? "允许" : r.behavior === "deny" ? "拒绝" : "询问"}
+                </Status>
+                <code className="mono" style={{ fontWeight: 600 }}>
+                  {r.rule}
+                </code>
+                <Chip>{r.scope === "global" ? "全局" : "当前工作区"}</Chip>
+                {r.note && <span className="muted truncate">{r.note}</span>}
+                <span className="grow" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="trash"
+                  title="删除规则"
+                  onClick={() => void handleDeleteRule(r.id)}
+                />
+              </div>
+            ))
+          )}
         </div>
 
         <div className="rule-editor">
@@ -288,7 +390,7 @@ function PermissionsSettings() {
             <Seg
               value={scope}
               options={[
-                { value: "workspace", label: "当前工作区" },
+                { value: "workspace", label: "当前工作区", disabled: !activeWorkspace },
                 { value: "global", label: "全局" },
               ]}
               onChange={setScope}
@@ -319,10 +421,235 @@ function PermissionsSettings() {
               添加规则
             </Button>
           </div>
-          <div className="hint">
-            语法示例：<code className="mono">Bash(npm.cmd test*)</code>、
-            <code className="mono">Edit(src/**)</code>、<code className="mono">Write(*.md)</code>、
-            <code className="mono">Bash(rm -rf *)</code>
+          <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+            <span className="hint">点击填入示例：</span>
+            <button
+              type="button"
+              className="perm-preset"
+              onClick={() => fillExample("allow", "Bash(npm.cmd run build*)", "允许执行项目构建")}
+            >
+              允许 Bash(npm.cmd run build*)
+            </button>
+            <button
+              type="button"
+              className="perm-preset"
+              onClick={() => fillExample("allow", "Edit(src/**)", "允许编辑 src 目录代码")}
+            >
+              允许 Edit(src/**)
+            </button>
+            <button
+              type="button"
+              className="perm-preset"
+              onClick={() => fillExample("deny", "Bash(rm*)", "禁止终端执行 rm 删除")}
+            >
+              拒绝 Bash(rm*)
+            </button>
+            <button
+              type="button"
+              className="perm-preset"
+              onClick={() => fillExample("ask", "Bash(git commit*)", "提交前强制人工确认")}
+            >
+              询问 Bash(git commit*)
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Interactive Command & Rule Simulator */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head">
+          <Icon name="shield" size={16} className="accent" />
+          <h3>命令与规则试算器</h3>
+          <span className="sub">输入任意命令或文件路径，实时查看真实拦截引擎的拆解与判定结果</span>
+        </div>
+        <div className="panel-body col" style={{ gap: 12 }}>
+          <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
+            <Seg
+              value={testKind}
+              options={[
+                { value: "shell", label: "终端命令" },
+                { value: "edit", label: "文件编辑" },
+                { value: "delete", label: "文件删除" },
+                { value: "read", label: "文件读取" },
+              ]}
+              onChange={(k) => {
+                setTestKind(k);
+                setTestResult(null);
+              }}
+            />
+            <Seg<PermissionMode>
+              value={testMode}
+              options={[
+                { value: "default", label: "默认询问" },
+                { value: "acceptEdits", label: "自动接受编辑" },
+                { value: "bypassPermissions", label: "全自动执行" },
+              ]}
+              onChange={(m) => {
+                setTestMode(m);
+                if (testInput.trim()) void runEvaluate(testKind, testInput, m);
+              }}
+            />
+          </div>
+
+          <div className="row" style={{ gap: 8 }}>
+            <input
+              className="input mono grow"
+              placeholder={
+                testKind === "shell"
+                  ? "输入任意 Shell / PowerShell 命令，如 npm.cmd test && rm -r -f src"
+                  : "输入相对路径或绝对路径，如 src/index.ts 或 ../../secret.txt"
+              }
+              value={testInput}
+              onChange={(e) => setTestInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (isPlainEnter(e)) void runEvaluate();
+              }}
+            />
+            <Button
+              variant="primary"
+              icon="play"
+              busy={testing}
+              disabled={!testInput.trim()}
+              onClick={() => void runEvaluate()}
+            >
+              测试判定
+            </Button>
+          </div>
+
+          <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+            <span className="hint">快捷测试样例：</span>
+            {TESTER_PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                className="perm-preset"
+                onClick={() => {
+                  setTestKind(p.toolKind);
+                  setTestInput(p.inputText);
+                  void runEvaluate(p.toolKind, p.inputText, testMode);
+                }}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {testResult && (
+            <div className={cx("perm-tester-result", testResult.preview.action)}>
+              <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+                <Status
+                  tone={
+                    testResult.preview.action === "allow"
+                      ? "good"
+                      : testResult.preview.action === "deny"
+                        ? "crit"
+                        : "warn"
+                  }
+                >
+                  {testResult.preview.action === "allow"
+                    ? "自动放行"
+                    : testResult.preview.action === "deny"
+                      ? "直接拒绝"
+                      : "弹窗询问"}
+                </Status>
+                <b>{testResult.preview.provenance}</b>
+                <span className="grow" />
+                <Chip>{TESTER_CATEGORY_LABEL[testResult.preview.category]}</Chip>
+                {testResult.preview.outsideWorkspace && <Chip tone="crit">越出工作目录</Chip>}
+                {testResult.preview.isRisky && <Chip tone="crit">高风险</Chip>}
+                {testResult.preview.hazards.hasRedirection && <Chip tone="warn">输出重定向</Chip>}
+                {testResult.preview.hazards.hasCommandSub && <Chip tone="warn">命令替换</Chip>}
+                {testResult.preview.hazards.hasDynamicEval && <Chip tone="warn">动态求值</Chip>}
+                {testResult.preview.hazards.hasPipeToShell && <Chip tone="crit">管道直连脚本</Chip>}
+              </div>
+
+              <div className="hint mono">基准工作目录：{testResult.cwd}</div>
+
+              {testResult.preview.reasons.length > 0 && (
+                <div className="perm-reasons">
+                  {testResult.preview.reasons.map((r, i) => (
+                    <div key={i} className="perm-reason-item">
+                      <Icon name="info" size={13} className="accent" />
+                      <span>{r}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {testResult.preview.subCommands.length > 0 && (
+                <div className="perm-subcmds">
+                  <div className="hint" style={{ fontWeight: 600 }}>
+                    子命令拆解结果（共 {testResult.preview.subCommands.length} 条）
+                  </div>
+                  {testResult.preview.subCommands.map((seg, i) => (
+                    <div key={i} className="perm-subcmd-row">
+                      <Status
+                        tone={
+                          seg.classification === "read_only"
+                            ? "good"
+                            : seg.classification === "destructive"
+                              ? "crit"
+                              : "warn"
+                        }
+                      >
+                        {seg.classification === "read_only"
+                          ? "纯只读"
+                          : seg.classification === "destructive"
+                            ? "高危"
+                            : "需确认"}
+                      </Status>
+                      <code className="mono truncate" style={{ maxWidth: "52%" }} title={seg.raw}>
+                        {seg.raw}
+                      </code>
+                      {seg.reasons[0] && (
+                        <span className="muted truncate" style={{ fontSize: 11.5 }}>
+                          {seg.reasons[0]}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Built-in Guardrails Summary */}
+      <div className="panel">
+        <div className="panel-head">
+          <h3>内置拦截机制与安全底线</h3>
+        </div>
+        <div className="panel-body perm-guide-grid">
+          <div className="perm-guide-item">
+            <b>1. 复合命令逐条拆解，防拼接绕过</b>
+            <p>
+              对 <code className="mono">&&</code>、<code className="mono">;</code>、
+              <code className="mono">|</code>、<code className="mono">||</code> 拆分为独立子命令。
+              哪怕配置了 <code className="mono">Bash(npm.cmd test*)</code>，如果后面拼接了其他未授权命令或删文件操作，仍会被整体拦截。
+            </p>
+          </div>
+          <div className="perm-guide-item">
+            <b>2. 重定向与动态求值禁止走白名单</b>
+            <p>
+              包含 <code className="mono">&gt;</code> / <code className="mono">&gt;&gt;</code> 写文件重定向、
+              <code className="mono">$(...)</code> 命令替换、或 <code className="mono">eval</code> /{" "}
+              <code className="mono">iex</code> / <code className="mono">bash -c</code> /{" "}
+              <code className="mono">-EncodedCommand</code> 时，不会命中只读白名单或前缀允许规则。
+            </p>
+          </div>
+          <div className="perm-guide-item">
+            <b>3. 严苛只读白名单（Fail-Closed）</b>
+            <p>
+              仅 <code className="mono">git status/diff/log/show</code>、<code className="mono">ls/dir/cat/rg/tsc --noEmit</code> 等明确无副作用命令自动放行；
+              其余一切未识别命令（如 <code className="mono">node</code> / <code className="mono">python</code> / <code className="mono">sed</code>）默认按可能修改处理并询问。
+            </p>
+          </div>
+          <div className="perm-guide-item">
+            <b>4. 目录边界与删除保护（Worktree 地基）</b>
+            <p>
+              所有读写、编辑、删除与终端切换目录均做真实路径归一化校验；越出当前任务工作目录的操作以及文件删除操作，即使在「自动接受编辑」或「全自动执行」模式下也强制弹窗确认。
+            </p>
           </div>
         </div>
       </div>

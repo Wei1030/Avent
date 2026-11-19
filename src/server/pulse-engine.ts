@@ -536,7 +536,11 @@ export class PulseEngine {
           onCheckPermission: async (req) => {
             const latestTask = this.store.getTask(taskId) ?? refreshedTask;
             const rules = this.store.listPermissionRules(latestTask.workspaceId);
-            const desc = describeToolCall(req.rawName, req.rawTitle, req.rawInput);
+            const desc = describeToolCall(req.rawName, req.rawTitle, req.rawInput, {
+              rawKind: req.rawKind,
+              cwd: latestTask.cwd,
+              allowedReadRoots: [this.store.spillsDir],
+            });
             const evaluated = evaluateToolPermission({
               mode: latestTask.permissionMode,
               rules,
@@ -575,9 +579,18 @@ export class PulseEngine {
               workspaceId: latestTask.workspaceId,
               toolCallId: req.toolCallId,
               toolName: desc.toolName,
+              category: desc.category,
               detail: desc.displayDetail,
               rawInput: req.rawInput,
               risky: desc.isRisky,
+              outsideWorkspace: desc.outsideWorkspace,
+              reasons: desc.reasons.length > 0 ? desc.reasons : [evaluated.provenance],
+              subCommands: desc.shellAnalysis?.segments.map((s) => ({
+                raw: s.raw,
+                executable: s.executable,
+                classification: s.classification,
+                reasons: s.reasons,
+              })),
               suggestedRule: desc.suggestedRule,
               createdAt: new Date().toISOString(),
             };

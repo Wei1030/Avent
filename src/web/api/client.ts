@@ -8,6 +8,7 @@ import type {
   EndpointProtocol,
   InstructionDoc,
   McpServerRecord,
+  PermissionEvaluationPreview,
   PermissionMode,
   PermissionRuleRecord,
   ProviderId,
@@ -266,6 +267,17 @@ export const api = {
 
   deleteRule: (id: string) =>
     req<{ ok: boolean }>(`/api/rules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  evaluateRule: (body: {
+    toolKind: "shell" | "edit" | "delete" | "read" | "other";
+    inputText: string;
+    mode?: PermissionMode;
+    workspaceId?: string;
+  }) =>
+    req<{ preview: PermissionEvaluationPreview; cwd: string }>("/api/rules/evaluate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   listProviders: () =>
     req<{

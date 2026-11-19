@@ -9,6 +9,7 @@ import { AventStore } from "./db.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { PulseEngine } from "./pulse-engine.js";
 import { probeMcpServer } from "./mcp-probe.js";
+import { previewToolPermission } from "./permissions.js";
 import { boundedDocRead, searchPulseHistory, surgicalGrep } from "./selective-io.js";
 import {
   thinkingModeToLevels,
@@ -755,6 +756,26 @@ export function createAventApp(options?: {
   app.delete("/api/rules/:id", (c) => {
     store.deletePermissionRule(c.req.param("id"));
     return c.json({ ok: true });
+  });
+
+  app.post("/api/rules/evaluate", async (c) => {
+    const body = await c.req.json<{
+      toolKind: "shell" | "edit" | "delete" | "read" | "other";
+      inputText: string;
+      mode?: PermissionMode;
+      workspaceId?: string;
+    }>();
+    const prefs = store.getPreferences();
+    const ws = body.workspaceId ? store.getWorkspace(body.workspaceId) : null;
+    const rules = store.listPermissionRules(ws?.id);
+    const preview = previewToolPermission({
+      toolKind: body.toolKind || "shell",
+      inputText: body.inputText ?? "",
+      mode: body.mode || prefs.defaultPermissionMode,
+      rules,
+      cwd: ws?.path || root,
+    });
+    return c.json({ preview, cwd: ws?.path || root });
   });
 
   app.get("/api/prefs", (c) => {

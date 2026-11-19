@@ -504,17 +504,17 @@ export function Composer({
               {
                 value: "default",
                 label: t("默认询问"),
-                desc: "只读自动放行，修改文件与执行命令前需确认",
+                desc: "工作区内只读工具与纯只读命令自动放行，其余读写删除与命令均需确认",
               },
               {
                 value: "acceptEdits",
                 label: t("自动接受编辑"),
-                desc: "自动允许读写代码文件，非常规命令仍会询问",
+                desc: "自动允许修改当前工作区内的代码文件，删除文件、越界操作与非常规命令仍会询问",
               },
               {
                 value: "bypassPermissions",
                 label: t("全自动执行"),
-                desc: "除高危拦截规则外自动执行所有工具",
+                desc: "自动执行工作区内常规操作，高危删除、越界修改与拒绝/询问规则仍会拦截",
               },
             ]}
             onChange={(permissionMode) => {

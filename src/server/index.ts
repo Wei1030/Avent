@@ -371,6 +371,7 @@ export function createAventApp(options?: {
         attachments: body.attachments,
         refs: body.refs,
       });
+      engine.broadcast({ type: "workspace_updated", workspaces: store.listWorkspaces() });
       return c.json({ task: sent.task }, 201);
     }
 

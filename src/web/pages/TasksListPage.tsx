@@ -7,7 +7,16 @@ import { Button, Chip, Select, Status } from "../components/ui.js";
 import { cx, fmtTokens, isPlainEnter, relTime, taskStatusDisplay } from "../lib/format.js";
 
 export function TasksListPage() {
-  const { workspaces, activeWorkspace, tasks, toast, lang, t } = useApp();
+  const {
+    workspaces,
+    activeWorkspace,
+    setActiveWorkspaceId,
+    setFolderPickerOpen,
+    tasks,
+    toast,
+    lang,
+    t,
+  } = useApp();
   const nav = useNavigate();
 
   const [q, setQ] = useState("");
@@ -15,18 +24,18 @@ export function TasksListPage() {
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
-  const [creating, setCreating] = useState(false);
 
   const filtered = useMemo(() => {
     const qLower = q.trim().toLowerCase();
     return tasks.filter((tk) => {
+      if (tk.status === "DRAFT") return false;
       if (wsFilter !== "all" && tk.workspaceId !== wsFilter) return false;
       if (statusFilter === "running") {
         if (tk.status !== "PULSING" && tk.status !== "WAITING_APPROVAL") return false;
       } else if (statusFilter === "completed") {
         if (tk.status !== "COMPLETED") return false;
       } else if (statusFilter === "active") {
-        if (tk.status === "COMPLETED" || tk.status === "DRAFT") return false;
+        if (tk.status === "COMPLETED") return false;
       }
       if (
         qLower &&
@@ -39,17 +48,14 @@ export function TasksListPage() {
     });
   }, [tasks, wsFilter, statusFilter, q]);
 
-  const handleNewTask = async () => {
-    setCreating(true);
-    try {
-      const targetWs = wsFilter !== "all" ? wsFilter : activeWorkspace?.id;
-      const res = await api.createTask({ workspaceId: targetWs, draft: true });
-      nav(`/t/${res.task.id}`);
-    } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), "crit");
-    } finally {
-      setCreating(false);
+  const handleNewTask = () => {
+    if (workspaces.length === 0) {
+      setFolderPickerOpen(true);
+      return;
     }
+    const targetWs = wsFilter !== "all" ? wsFilter : activeWorkspace?.id;
+    if (targetWs) setActiveWorkspaceId(targetWs);
+    nav("/t/new");
   };
 
   const commitRename = async (id: string) => {
@@ -70,16 +76,11 @@ export function TasksListPage() {
           <h1>{t("全部任务")}</h1>
           <Chip>{filtered.length}</Chip>
           <div className="grow" />
-          <Button
-            variant="primary"
-            icon="plus"
-            busy={creating}
-            onClick={() => void handleNewTask()}
-          >
+          <Button variant="primary" icon="plus" onClick={handleNewTask}>
             {t("新建任务")}
           </Button>
         </div>
-        <p className="page-sub">查看、检索和管理所有工作区下的任务及其状态记忆版本。</p>
+        <p className="page-sub">查看、检索和管理所有工作区下的任务及其状态记忆。</p>
 
         <div className="filter-row">
           <div className="input-wrap" style={{ width: 280 }}>
@@ -143,7 +144,10 @@ export function TasksListPage() {
                 workspaces.find((w) => w.id === tk.workspaceId)?.name || "默认工作区";
               return (
                 <div key={tk.id} className="srow" onClick={() => nav(`/t/${tk.id}`)}>
-                  <div className="srow-title" onClick={(e) => editingId === tk.id && e.stopPropagation()}>
+                  <div
+                    className="srow-title"
+                    onClick={(e) => editingId === tk.id && e.stopPropagation()}
+                  >
                     <span className={cx("sdot", st.dotClass)} style={{ marginTop: 0 }} />
                     {editingId === tk.id ? (
                       <input

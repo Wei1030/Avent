@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
@@ -8,32 +7,19 @@ import { cx, fmtTokens, relTime, taskStatusDisplay } from "../lib/format.js";
 
 export function HomePage() {
   const {
+    ready,
     workspaces,
     activeWorkspace,
     setActiveWorkspaceId,
     setWorkspaces,
     tasks,
     setFolderPickerOpen,
+    resolveWorkspaceTaskRoute,
     toast,
     lang,
     t,
   } = useApp();
   const nav = useNavigate();
-  const [creating, setCreating] = useState(false);
-
-  const startNewTask = async (workspaceId?: string) => {
-    setCreating(true);
-    try {
-      const wsId = workspaceId || activeWorkspace?.id;
-      if (wsId) setActiveWorkspaceId(wsId);
-      const res = await api.createTask({ workspaceId: wsId, draft: true });
-      nav(`/t/${res.task.id}`);
-    } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), "crit");
-    } finally {
-      setCreating(false);
-    }
-  };
 
   const handleRemoveWs = async (wsId: string, name: string) => {
     try {
@@ -47,26 +33,59 @@ export function HomePage() {
 
   const recentTasks = tasks.filter((tk) => tk.status !== "DRAFT").slice(0, 10);
 
+  if (!ready) {
+    return (
+      <div className="page">
+        <div className="loading-block">
+          <span className="spinner" /> 正在加载工作区…
+        </div>
+      </div>
+    );
+  }
+
+  // Dedicated zero-workspace onboarding state
+  if (workspaces.length === 0) {
+    return (
+      <div className="page">
+        <div className="ws-empty">
+          <div className="ws-empty-icon">
+            <Icon name="folder" size={26} />
+          </div>
+          <h2>还没有添加任何工作区</h2>
+          <p>
+            选择一个本地代码库或项目文件夹作为工作区，Avent
+            即可在该目录下结合多厂商订阅模型与结构化「状态记忆」持续协助你完成分析、开发与验证。
+          </p>
+          <div className="ws-empty-actions">
+            <Button
+              variant="primary"
+              size="lg"
+              icon="folder"
+              onClick={() => setFolderPickerOpen(true)}
+            >
+              添加第一个工作区
+            </Button>
+          </div>
+          <div className="ws-empty-note">
+            添加或移除工作区仅影响 Avent 的项目列表，不会移动或删除本地磁盘上的任何文件。
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="page">
       <div className="page-inner">
         <div className="page-title">
           <h1>{t("工作区")}</h1>
           <div className="grow" />
-          <Button icon="folder" onClick={() => setFolderPickerOpen(true)}>
+          <Button variant="primary" icon="folder" onClick={() => setFolderPickerOpen(true)}>
             {t("添加工作区")}
-          </Button>
-          <Button
-            variant="primary"
-            icon="plus"
-            busy={creating}
-            onClick={() => void startNewTask()}
-          >
-            {t("新建任务")}
           </Button>
         </div>
         <p className="page-sub">
-          选择一个项目工作区发起任务，智能体会结合各家订阅模型与结构化状态记忆持续推进并完成验证。
+          选择一个项目工作区进入对话，智能体会结合各家订阅模型与结构化状态记忆持续推进任务。
         </p>
 
         {/* Workspace Cards Grid */}
@@ -77,27 +96,20 @@ export function HomePage() {
               className={cx("ws-card", activeWorkspace?.id === ws.id && "active")}
               onClick={() => {
                 setActiveWorkspaceId(ws.id);
-                const latestInWs = tasks.find((tk) => tk.workspaceId === ws.id);
-                if (latestInWs) {
-                  nav(`/t/${latestInWs.id}`);
-                } else {
-                  void startNewTask(ws.id);
-                }
+                nav(resolveWorkspaceTaskRoute(ws.id));
               }}
             >
-              {workspaces.length > 1 && (
-                <button
-                  type="button"
-                  className="ws-remove"
-                  title="从列表移除此工作区（不删除本地文件）"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void handleRemoveWs(ws.id, ws.name);
-                  }}
-                >
-                  <Icon name="x" size={14} />
-                </button>
-              )}
+              <button
+                type="button"
+                className="ws-remove"
+                title="从列表移除此工作区（不删除本地文件）"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleRemoveWs(ws.id, ws.name);
+                }}
+              >
+                <Icon name="x" size={14} />
+              </button>
 
               <div className="ws-card-head">
                 <div className="ws-icon">
@@ -129,16 +141,9 @@ export function HomePage() {
 
               <div className="ws-card-foot muted">
                 <span>{ws.taskCount ?? 0} 个任务</span>
-                <button
-                  type="button"
-                  className="link-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void startNewTask(ws.id);
-                  }}
-                >
-                  + 在此新建任务
-                </button>
+                <span className="accent" style={{ fontSize: 12 }}>
+                  进入工作区 →
+                </span>
               </div>
             </div>
           ))}
@@ -158,7 +163,7 @@ export function HomePage() {
           <div className="panel">
             <div className="empty">
               <b>还没有进行过任务</b>
-              点击右上角「新建任务」开始你的第一个任务。
+              点击上方任意工作区即可开始你的第一个任务。
             </div>
           </div>
         ) : (

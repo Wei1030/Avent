@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Navigate, useNavigate, useParams } from "react-router-dom";
+import type { TaskProviderId, TaskRecord } from "../../shared/types.js";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
+import { resolveThoughtLevelsForSelection } from "../components/ModelPicker.js";
 import { Button, Chip, Status } from "../components/ui.js";
 import { ApprovalPanel } from "../task/ApprovalPanel.js";
 import { Composer } from "../task/Composer.js";
@@ -14,39 +16,61 @@ export function TaskPage() {
   const { id } = useParams<{ id: string }>();
   const nav = useNavigate();
   const {
+    ready,
     workspaces,
     activeWorkspace,
     setActiveWorkspaceId,
     tasks,
     taskDetails,
     loadTaskDetail,
+    providers,
+    endpoints,
+    prefs,
     statePanelOpen,
     setStatePanelOpen,
+    getNewTaskConfig,
+    updateNewTaskConfig,
+    recordTaskView,
     toast,
     lang,
     t,
   } = useApp();
 
+  const isNewDraft = id === "new";
+
   const [renamingTitle, setRenamingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [notFound, setNotFound] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (id) {
-      void loadTaskDetail(id);
+    setNotFound(false);
+    setRenamingTitle(false);
+    if (id && id !== "new") {
+      void loadTaskDetail(id).then((res) => {
+        if (!res) setNotFound(true);
+      });
     }
   }, [id, loadTaskDetail]);
 
-  const detail = id ? taskDetails[id] : undefined;
-  const currentTask = detail?.task ?? tasks.find((tk) => tk.id === id);
+  const detail = !isNewDraft && id ? taskDetails[id] : undefined;
+  const loadedTask = !isNewDraft
+    ? detail?.task ?? tasks.find((tk) => tk.id === id)
+    : undefined;
 
-  // Sync active workspace to match opened task
+  // Sync active workspace & remember last viewed task per workspace
   useEffect(() => {
-    if (currentTask?.workspaceId && currentTask.workspaceId !== activeWorkspace?.id) {
-      setActiveWorkspaceId(currentTask.workspaceId);
+    if (!isNewDraft && loadedTask) {
+      if (loadedTask.workspaceId && loadedTask.workspaceId !== activeWorkspace?.id) {
+        setActiveWorkspaceId(loadedTask.workspaceId);
+      }
+      if (loadedTask.workspaceId) {
+        recordTaskView(loadedTask.workspaceId, loadedTask.id);
+      }
+    } else if (isNewDraft && activeWorkspace?.id) {
+      recordTaskView(activeWorkspace.id, "new");
     }
-  }, [currentTask?.workspaceId]);
+  }, [isNewDraft, loadedTask?.id, loadedTask?.workspaceId, activeWorkspace?.id, setActiveWorkspaceId, recordTaskView]);
 
   // Auto-scroll transcript when new items stream in
   useEffect(() => {
@@ -58,9 +82,92 @@ export function TaskPage() {
     }
   }, [detail?.items]);
 
-  const workspaceId = currentTask?.workspaceId || activeWorkspace?.id || "";
+  const workspaceId = (!isNewDraft ? loadedTask?.workspaceId : undefined) || activeWorkspace?.id || "";
+  const wsObj = workspaces.find((w) => w.id === workspaceId);
+
+  // Resolve virtual TaskRecord for ephemeral `/t/new` draft view
+  const draftConfig = getNewTaskConfig(workspaceId);
+  const virtualDraftTask = useMemo<TaskRecord>(() => {
+    const providerId: TaskProviderId =
+      draftConfig.providerId || prefs.defaultProviderId || providers[0]?.id || "agy";
+
+    let modelId = draftConfig.modelId ?? "";
+    if (!modelId) {
+      if (providerId.startsWith("endpoint:")) {
+        const ep = endpoints.find((e) => `endpoint:${e.id}` === providerId);
+        modelId =
+          (providerId === prefs.defaultProviderId &&
+          prefs.defaultModelId &&
+          ep?.models.some((m) => m.id === prefs.defaultModelId)
+            ? prefs.defaultModelId
+            : "") ||
+          ep?.models[0]?.id ||
+          "";
+      } else {
+        const prov = providers.find((p) => p.id === providerId);
+        modelId =
+          (providerId === prefs.defaultProviderId &&
+          prefs.defaultModelId &&
+          prov?.models.some((m) => m.value === prefs.defaultModelId)
+            ? prefs.defaultModelId
+            : "") ||
+          prov?.defaultModel ||
+          prov?.models[0]?.value ||
+          "";
+      }
+    }
+
+    const { levels, defaultLevel } = resolveThoughtLevelsForSelection(
+      providers,
+      endpoints,
+      providerId,
+      modelId
+    );
+    const candidateThought =
+      draftConfig.thoughtLevel ??
+      (providerId === prefs.defaultProviderId ? prefs.defaultThoughtLevel : "");
+    const thoughtLevel =
+      levels.length === 0
+        ? ""
+        : levels.some((l) => l.value === candidateThought)
+          ? candidateThought
+          : defaultLevel;
+
+    return {
+      id: "__new__",
+      workspaceId,
+      title: t("新任务"),
+      titleSource: "auto",
+      originalObjective: "",
+      objectiveSource: "auto",
+      completionCriteria: [],
+      steeringDirectives: [],
+      tags: [],
+      cwd: wsObj?.path || "",
+      providerId,
+      modelId,
+      thoughtLevel,
+      permissionMode: draftConfig.permissionMode || prefs.defaultPermissionMode,
+      pulseMode: "micro-stretch",
+      status: "DRAFT",
+      currentVersion: 0,
+      pulseCount: 0,
+      totalTokens: 0,
+      latestState: null,
+      createdAt: "",
+      updatedAt: "",
+    };
+  }, [draftConfig, prefs, providers, endpoints, workspaceId, wsObj?.path, t]);
+
+  const currentTask = isNewDraft ? virtualDraftTask : loadedTask;
+
+  // Real persisted tasks in current workspace (never duplicate empty DRAFT rows)
   const wsTasks = useMemo(
-    () => tasks.filter((tk) => !workspaceId || tk.workspaceId === workspaceId),
+    () =>
+      tasks.filter(
+        (tk) =>
+          tk.status !== "DRAFT" && (!workspaceId || tk.workspaceId === workspaceId)
+      ),
     [tasks, workspaceId]
   );
 
@@ -80,22 +187,27 @@ export function TaskPage() {
     [wsTasks]
   );
 
-  const handleCreateNew = async () => {
-    setCreating(true);
-    try {
-      const res = await api.createTask({ workspaceId, draft: true });
-      nav(`/t/${res.task.id}`);
-    } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), "crit");
-    } finally {
-      setCreating(false);
+  // If no workspaces exist at all, show the zero-workspace onboarding view
+  if (ready && workspaces.length === 0) {
+    return <Navigate to="/" replace />;
+  }
+
+  // If URL pointed to a deleted/unknown task, fall back cleanly to latest task or new-task draft
+  if (!isNewDraft && notFound && !loadedTask) {
+    const fallback = wsTasks[0] ? `/t/${wsTasks[0].id}` : "/t/new";
+    return <Navigate to={fallback} replace />;
+  }
+
+  const handleOpenNewDraft = () => {
+    if (!isNewDraft) {
+      nav("/t/new");
     }
   };
 
   const handleSaveTitle = async () => {
     setRenamingTitle(false);
     const trimmed = titleDraft.trim();
-    if (!currentTask || !trimmed || trimmed === currentTask.title) return;
+    if (isNewDraft || !currentTask || !trimmed || trimmed === currentTask.title) return;
     try {
       await api.updateTask(currentTask.id, { title: trimmed });
     } catch (err) {
@@ -108,24 +220,19 @@ export function TaskPage() {
       await api.deleteTask(targetId);
       if (targetId === id) {
         const next = wsTasks.find((x) => x.id !== targetId);
-        nav(next ? `/t/${next.id}` : "/");
+        nav(next ? `/t/${next.id}` : "/t/new", { replace: true });
       }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     }
   };
 
-  const handleQuickPrompt = async (promptText: string) => {
-    if (!currentTask) return;
-    try {
-      await api.sendMessage(currentTask.id, { text: promptText });
-    } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), "crit");
-    }
-  };
+  const stDisplay =
+    !isNewDraft && currentTask ? taskStatusDisplay(currentTask.status, t) : null;
 
-  const wsObj = workspaces.find((w) => w.id === workspaceId);
-  const stDisplay = currentTask ? taskStatusDisplay(currentTask.status, t) : null;
+  const draftKey = isNewDraft
+    ? `new:${workspaceId || "default"}`
+    : currentTask?.id || "";
 
   return (
     <div className="session-layout">
@@ -135,9 +242,8 @@ export function TaskPage() {
           <Button
             variant="primary"
             icon="plus"
-            busy={creating}
             style={{ width: "100%" }}
-            onClick={() => void handleCreateNew()}
+            onClick={handleOpenNewDraft}
           >
             {t("新建任务")}
           </Button>
@@ -155,7 +261,7 @@ export function TaskPage() {
                 return (
                   <div
                     key={tk.id}
-                    className={cx("scol-item", tk.id === id && "on")}
+                    className={cx("scol-item", !isNewDraft && tk.id === id && "on")}
                     onClick={() => nav(`/t/${tk.id}`)}
                   >
                     <span className={cx("sdot", st.dotClass)} />
@@ -175,12 +281,24 @@ export function TaskPage() {
             <span>任务列表</span>
             <span className="n">{otherList.length}</span>
           </h5>
+
+          {/* Single ephemeral "新任务" entry: visible ONLY while composing a new task; hides automatically when switching away */}
+          {isNewDraft && (
+            <div className="scol-item on">
+              <span className="sdot idle" />
+              <div className="grow" style={{ minWidth: 0 }}>
+                <div className="t truncate">{t("新任务")}</div>
+                <div className="m">草稿</div>
+              </div>
+            </div>
+          )}
+
           {otherList.map((tk) => {
             const st = taskStatusDisplay(tk.status, t);
             return (
               <div
                 key={tk.id}
-                className={cx("scol-item", tk.id === id && "on")}
+                className={cx("scol-item", !isNewDraft && tk.id === id && "on")}
                 onClick={() => nav(`/t/${tk.id}`)}
               >
                 <span className={cx("sdot", st.dotClass)} />
@@ -219,7 +337,7 @@ export function TaskPage() {
           <>
             <header className="shead">
               <div className="title grow">
-                {renamingTitle ? (
+                {!isNewDraft && renamingTitle ? (
                   <input
                     autoFocus
                     className="input sm"
@@ -235,16 +353,18 @@ export function TaskPage() {
                 ) : (
                   <>
                     <span className="truncate">{currentTask.title}</span>
-                    <span
-                      className="edit"
-                      title={t("重命名")}
-                      onClick={() => {
-                        setTitleDraft(currentTask.title);
-                        setRenamingTitle(true);
-                      }}
-                    >
-                      <Icon name="pencil" size={13} />
-                    </span>
+                    {!isNewDraft && (
+                      <span
+                        className="edit"
+                        title={t("重命名")}
+                        onClick={() => {
+                          setTitleDraft(currentTask.title);
+                          setRenamingTitle(true);
+                        }}
+                      >
+                        <Icon name="pencil" size={13} />
+                      </span>
+                    )}
                   </>
                 )}
                 {stDisplay && <Status tone={stDisplay.tone}>{stDisplay.label}</Status>}
@@ -256,7 +376,7 @@ export function TaskPage() {
                 </Chip>
               )}
 
-              {currentTask.status === "FAILED" && (
+              {!isNewDraft && currentTask.status === "FAILED" && (
                 <Button
                   size="sm"
                   icon="play"
@@ -280,18 +400,30 @@ export function TaskPage() {
               <div className="transcript-inner">
                 <TranscriptView
                   task={currentTask}
-                  items={detail?.items ?? []}
-                  onQuickPrompt={(p) => void handleQuickPrompt(p)}
+                  items={isNewDraft ? [] : detail?.items ?? []}
                 />
               </div>
             </div>
 
             <div className="dock">
               <div className="dock-inner">
-                {detail && detail.approvals.length > 0 && (
+                {!isNewDraft && detail && detail.approvals.length > 0 && (
                   <ApprovalPanel approvals={detail.approvals} />
                 )}
-                <Composer task={currentTask} />
+                <Composer
+                  key={draftKey}
+                  task={currentTask}
+                  draftKey={draftKey}
+                  isNewDraft={isNewDraft}
+                  onDraftConfigChange={(patch) => updateNewTaskConfig(workspaceId, patch)}
+                  onCreatedTask={(created) => {
+                    if (created.workspaceId) {
+                      recordTaskView(created.workspaceId, created.id);
+                    }
+                    void loadTaskDetail(created.id);
+                    nav(`/t/${created.id}`, { replace: true });
+                  }}
+                />
               </div>
             </div>
           </>
@@ -302,7 +434,11 @@ export function TaskPage() {
       {currentTask && statePanelOpen && (
         <SemanticStatePanel
           task={currentTask}
-          states={detail?.states ?? (currentTask.latestState ? [currentTask.latestState] : [])}
+          states={
+            isNewDraft
+              ? []
+              : detail?.states ?? (currentTask.latestState ? [currentTask.latestState] : [])
+          }
           onClose={() => setStatePanelOpen(false)}
         />
       )}

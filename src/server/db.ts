@@ -112,10 +112,21 @@ export class AventStore {
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.initSchema();
     this.ensureMigrations();
+    this.cleanupEmptyDraftTasks();
 
     if (defaultWorkspacePath) {
       this.ensureDefaultWorkspace(defaultWorkspacePath);
     }
+  }
+
+  private cleanupEmptyDraftTasks(): void {
+    this.db
+      .prepare(
+        `DELETE FROM tasks
+         WHERE status = 'DRAFT'
+           AND id NOT IN (SELECT DISTINCT task_id FROM task_items)`
+      )
+      .run();
   }
 
   private initSchema(): void {
@@ -355,26 +366,47 @@ export class AventStore {
     }
   }
 
-  public ensureDefaultWorkspace(wsPath: string): WorkspaceRecord {
+  public ensureDefaultWorkspace(wsPath: string): WorkspaceRecord | null {
     const resolved = path.resolve(wsPath);
     const existing = this.db
       .prepare(`SELECT * FROM workspaces WHERE LOWER(path) = LOWER(?)`)
       .get(resolved) as Record<string, unknown> | undefined;
 
+    const seededRow = this.db
+      .prepare(`SELECT value_json FROM prefs WHERE key = 'workspace_seeded'`)
+      .get() as { value_json: string } | undefined;
+
     let wsId: string;
     if (existing) {
       wsId = String(existing.id);
+      if (!seededRow) {
+        this.db
+          .prepare(`INSERT OR REPLACE INTO prefs (key, value_json) VALUES ('workspace_seeded', 'true')`)
+          .run();
+      }
     } else {
       const count = (
         this.db.prepare(`SELECT COUNT(*) as cnt FROM workspaces`).get() as { cnt: number }
       ).cnt;
       if (count > 0) {
+        if (!seededRow) {
+          this.db
+            .prepare(`INSERT OR REPLACE INTO prefs (key, value_json) VALUES ('workspace_seeded', 'true')`)
+            .run();
+        }
         const first = this.db
           .prepare(`SELECT * FROM workspaces ORDER BY pinned DESC, last_active_at DESC LIMIT 1`)
           .get() as Record<string, unknown>;
         return this.mapWorkspaceRow(first);
       }
+      if (seededRow) {
+        // User intentionally removed all workspaces; honor empty workspace list across restarts.
+        return null;
+      }
       const created = this.addWorkspace(resolved);
+      this.db
+        .prepare(`INSERT OR REPLACE INTO prefs (key, value_json) VALUES ('workspace_seeded', 'true')`)
+        .run();
       wsId = created.id;
     }
 
@@ -449,6 +481,18 @@ export class AventStore {
          VALUES (?, ?, ?, 0, ?, ?)`
       )
       .run(id, wsName, resolved, now, now);
+    this.db
+      .prepare(`INSERT OR REPLACE INTO prefs (key, value_json) VALUES ('workspace_seeded', 'true')`)
+      .run();
+    // Re-attach any historical tasks for this folder whose workspace entry was previously removed
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET workspace_id = ?
+         WHERE LOWER(cwd) = LOWER(?)
+           AND (workspace_id = '' OR workspace_id NOT IN (SELECT id FROM workspaces))`
+      )
+      .run(id, resolved);
     return this.getWorkspace(id)!;
   }
 
@@ -534,7 +578,7 @@ export class AventStore {
         `SELECT
            COUNT(*) as total,
            SUM(CASE WHEN status IN ('PULSING', 'WAITING_APPROVAL') THEN 1 ELSE 0 END) as running
-         FROM tasks WHERE workspace_id = ?`
+         FROM tasks WHERE workspace_id = ? AND status != 'DRAFT'`
       )
       .get(id) as { total: number; running: number | null };
     const git = this.getGitMeta(wsPath);

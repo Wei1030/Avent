@@ -4,17 +4,22 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import type {
   AppPreferences,
   ApprovalRequest,
+  AttachmentItem,
   CompatibleEndpointRecord,
   LiveStreamEvent,
+  PermissionMode,
   ProviderStatusInfo,
   TaskDetailResponse,
+  TaskProviderId,
   TaskRecord,
+  TaskRef,
   WorkspaceRecord,
 } from "../../shared/types.js";
 import { api } from "../api/client.js";
@@ -35,6 +40,48 @@ export interface FilePreviewTarget {
   endLine?: number;
 }
 
+export interface ComposerDraft {
+  text: string;
+  attachments: AttachmentItem[];
+  refs: TaskRef[];
+}
+
+export interface NewTaskConfig {
+  providerId?: TaskProviderId;
+  modelId?: string;
+  thoughtLevel?: string;
+  permissionMode?: PermissionMode;
+}
+
+const EMPTY_DRAFT: ComposerDraft = {
+  text: "",
+  attachments: [],
+  refs: [],
+};
+
+const DRAFTS_STORAGE_KEY = "avent.composerDrafts";
+const LAST_TASK_STORAGE_KEY = "avent.lastTaskView";
+const NEW_TASK_CFG_STORAGE_KEY = "avent.newTaskConfig";
+
+function safeReadJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeWriteJson(key: string, val: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch {
+    // Ignore storage quota / private mode failures
+  }
+}
+
 interface AppContextValue {
   ready: boolean;
   workspaces: WorkspaceRecord[];
@@ -50,7 +97,7 @@ interface AppContextValue {
   t: (key: string, vars?: Record<string, string | number>) => string;
   taskDetails: Record<string, TaskDetailResponse>;
   loadTaskDetail: (taskId: string) => Promise<TaskDetailResponse | null>;
-  refreshBootstrap: () => Promise<void>;
+  refreshBootstrap: () => Promise<{ workspaces: WorkspaceRecord[]; tasks: TaskRecord[] } | null>;
   updatePrefs: (patch: Partial<AppPreferences>) => Promise<void>;
   setProviders: (list: ProviderStatusInfo[]) => void;
   setEndpoints: (list: CompatibleEndpointRecord[]) => void;
@@ -65,6 +112,17 @@ interface AppContextValue {
   closeFilePreview: () => void;
   statePanelOpen: boolean;
   setStatePanelOpen: (open: boolean) => void;
+  // Persistent per-task & new-task composer drafts
+  getComposerDraft: (key: string) => ComposerDraft;
+  setComposerDraft: (key: string, draft: ComposerDraft) => void;
+  clearComposerDraft: (key: string) => void;
+  // Per-workspace new-task model/thought/permission overrides
+  getNewTaskConfig: (workspaceId: string) => NewTaskConfig;
+  updateNewTaskConfig: (workspaceId: string, patch: Partial<NewTaskConfig>) => void;
+  // Per-workspace last selected task view (taskId | "new")
+  lastTaskViewByWs: Record<string, string>;
+  recordTaskView: (workspaceId: string, view: string) => void;
+  resolveWorkspaceTaskRoute: (workspaceId?: string, overrideTasks?: TaskRecord[]) => string;
 }
 
 const DEFAULT_PREFS: AppPreferences = {
@@ -80,7 +138,7 @@ const AppCtx = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
-  const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
+  const [workspaces, setWorkspacesState] = useState<WorkspaceRecord[]>([]);
   const [activeWorkspaceId, setActiveWsState] = useState<string>(
     () => localStorage.getItem("avent.activeWs") || ""
   );
@@ -97,6 +155,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
     () => localStorage.getItem("avent.statePanelOpen") !== "false"
   );
 
+  // Ref-backed composer drafts (zero app-wide re-renders while typing, always synchronously persisted)
+  const draftsRef = useRef<Record<string, ComposerDraft>>(
+    safeReadJson<Record<string, ComposerDraft>>(DRAFTS_STORAGE_KEY, {})
+  );
+
+  const [newTaskConfigByWs, setNewTaskConfigByWs] = useState<Record<string, NewTaskConfig>>(() =>
+    safeReadJson<Record<string, NewTaskConfig>>(NEW_TASK_CFG_STORAGE_KEY, {})
+  );
+
+  const [lastTaskViewByWs, setLastTaskViewByWs] = useState<Record<string, string>>(() =>
+    safeReadJson<Record<string, string>>(LAST_TASK_STORAGE_KEY, {})
+  );
+
+  const setWorkspaces = useCallback((list: WorkspaceRecord[]) => {
+    setWorkspacesState(list);
+    setActiveWsState((cur) => {
+      if (cur && list.some((w) => w.id === cur)) return cur;
+      const next = list[0]?.id ?? "";
+      if (next) localStorage.setItem("avent.activeWs", next);
+      else localStorage.removeItem("avent.activeWs");
+      return next;
+    });
+  }, []);
+
   const setStatePanelOpen = useCallback((open: boolean) => {
     setStatePanelOpenState(open);
     localStorage.setItem("avent.statePanelOpen", String(open));
@@ -105,6 +187,73 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const setActiveWorkspaceId = useCallback((id: string) => {
     setActiveWsState(id);
     if (id) localStorage.setItem("avent.activeWs", id);
+    else localStorage.removeItem("avent.activeWs");
+  }, []);
+
+  const getComposerDraft = useCallback((key: string): ComposerDraft => {
+    const found = draftsRef.current[key];
+    if (!found) return EMPTY_DRAFT;
+    return {
+      text: typeof found.text === "string" ? found.text : "",
+      attachments: Array.isArray(found.attachments) ? found.attachments : [],
+      refs: Array.isArray(found.refs) ? found.refs : [],
+    };
+  }, []);
+
+  const setComposerDraft = useCallback((key: string, draft: ComposerDraft) => {
+    if (!key) return;
+    const isEmpty =
+      !draft.text && draft.attachments.length === 0 && draft.refs.length === 0;
+    if (isEmpty) {
+      if (key in draftsRef.current) {
+        delete draftsRef.current[key];
+        safeWriteJson(DRAFTS_STORAGE_KEY, draftsRef.current);
+      }
+      return;
+    }
+    draftsRef.current[key] = draft;
+    safeWriteJson(DRAFTS_STORAGE_KEY, draftsRef.current);
+  }, []);
+
+  const clearComposerDraft = useCallback((key: string) => {
+    if (!key || !(key in draftsRef.current)) return;
+    delete draftsRef.current[key];
+    safeWriteJson(DRAFTS_STORAGE_KEY, draftsRef.current);
+  }, []);
+
+  const getNewTaskConfig = useCallback(
+    (workspaceId: string): NewTaskConfig => {
+      return newTaskConfigByWs[workspaceId || "default"] ?? {};
+    },
+    [newTaskConfigByWs]
+  );
+
+  const updateNewTaskConfig = useCallback(
+    (workspaceId: string, patch: Partial<NewTaskConfig>) => {
+      const wsKey = workspaceId || "default";
+      setNewTaskConfigByWs((prev) => {
+        const next = {
+          ...prev,
+          [wsKey]: {
+            ...(prev[wsKey] ?? {}),
+            ...patch,
+          },
+        };
+        safeWriteJson(NEW_TASK_CFG_STORAGE_KEY, next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const recordTaskView = useCallback((workspaceId: string, view: string) => {
+    if (!workspaceId || !view) return;
+    setLastTaskViewByWs((prev) => {
+      if (prev[workspaceId] === view) return prev;
+      const next = { ...prev, [workspaceId]: view };
+      safeWriteJson(LAST_TASK_STORAGE_KEY, next);
+      return next;
+    });
   }, []);
 
   const toast = useCallback((text: string, tone: ToastItem["tone"] = "good") => {
@@ -128,14 +277,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setProviders(data.providers);
       setEndpoints(data.endpoints ?? []);
       setPrefs(data.prefs);
-      setActiveWsState((cur) => {
-        if (cur && data.workspaces.some((w) => w.id === cur)) return cur;
-        return data.workspaces[0]?.id ?? "";
-      });
+      return { workspaces: data.workspaces, tasks: data.tasks };
+    } catch {
+      return null;
     } finally {
       setReady(true);
     }
-  }, []);
+  }, [setWorkspaces]);
 
   const loadTaskDetail = useCallback(async (taskId: string) => {
     try {
@@ -223,6 +371,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
             delete copy[ev.taskId];
             return copy;
           });
+          clearComposerDraft(ev.taskId);
+          setLastTaskViewByWs((prev) => {
+            let changed = false;
+            const copy = { ...prev };
+            for (const [wsId, v] of Object.entries(copy)) {
+              if (v === ev.taskId) {
+                delete copy[wsId];
+                changed = true;
+              }
+            }
+            if (changed) safeWriteJson(LAST_TASK_STORAGE_KEY, copy);
+            return changed ? copy : prev;
+          });
           break;
         }
 
@@ -301,7 +462,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       es.removeEventListener("avent", onAvent as EventListener);
       es.close();
     };
-  }, []);
+  }, [setWorkspaces, clearComposerDraft]);
 
   const lang = useMemo(() => resolveEffectiveLang(prefs.uiLanguage), [prefs.uiLanguage]);
   const t = useCallback(
@@ -312,6 +473,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const activeWorkspace = useMemo(
     () => workspaces.find((w) => w.id === activeWorkspaceId) ?? workspaces[0] ?? null,
     [workspaces, activeWorkspaceId]
+  );
+
+  const resolveWorkspaceTaskRoute = useCallback(
+    (workspaceId?: string, overrideTasks?: TaskRecord[]): string => {
+      const wsId = workspaceId || activeWorkspace?.id || workspaces[0]?.id || "";
+      if (!wsId) return "/";
+      const pool = overrideTasks ?? tasks;
+      const wsRealTasks = pool.filter(
+        (tk) => tk.workspaceId === wsId && tk.status !== "DRAFT"
+      );
+      const last = lastTaskViewByWs[wsId];
+      if (last === "new") return "/t/new";
+      if (last && wsRealTasks.some((tk) => tk.id === last)) {
+        return `/t/${last}`;
+      }
+      if (wsRealTasks.length > 0) {
+        return `/t/${wsRealTasks[0].id}`;
+      }
+      return "/t/new";
+    },
+    [activeWorkspace?.id, workspaces, tasks, lastTaskViewByWs]
   );
 
   const value = useMemo<AppContextValue>(
@@ -345,6 +527,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       closeFilePreview,
       statePanelOpen,
       setStatePanelOpen,
+      getComposerDraft,
+      setComposerDraft,
+      clearComposerDraft,
+      getNewTaskConfig,
+      updateNewTaskConfig,
+      lastTaskViewByWs,
+      recordTaskView,
+      resolveWorkspaceTaskRoute,
     }),
     [
       ready,
@@ -362,6 +552,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       loadTaskDetail,
       refreshBootstrap,
       updatePrefs,
+      setWorkspaces,
       toast,
       dismissToast,
       toasts,
@@ -371,6 +562,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       closeFilePreview,
       statePanelOpen,
       setStatePanelOpen,
+      getComposerDraft,
+      setComposerDraft,
+      clearComposerDraft,
+      getNewTaskConfig,
+      updateNewTaskConfig,
+      lastTaskViewByWs,
+      recordTaskView,
+      resolveWorkspaceTaskRoute,
     ]
   );
 

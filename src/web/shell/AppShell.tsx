@@ -23,6 +23,7 @@ export function AppShell() {
     setFolderPickerOpen,
     toasts,
     dismissToast,
+    resolveWorkspaceTaskRoute,
   } = useApp();
 
   const nav = useNavigate();
@@ -54,15 +55,16 @@ export function AppShell() {
 
   // Filtered global search results
   const qLower = searchQ.trim().toLowerCase();
+  const realTasks = tasks.filter((tk) => tk.status !== "DRAFT");
   const matchingTasks = qLower
-    ? tasks
+    ? realTasks
         .filter(
           (tk) =>
             tk.title.toLowerCase().includes(qLower) ||
             tk.originalObjective.toLowerCase().includes(qLower)
         )
         .slice(0, 6)
-    : tasks.slice(0, 5);
+    : realTasks.slice(0, 5);
 
   const quickNavItems = [
     { label: "订阅与模型设置", desc: "配置 Google AI Ultra / Claude / Codex", path: "/settings/provider" },
@@ -88,7 +90,7 @@ export function AppShell() {
           <span>Avent</span>
         </div>
 
-        {workspaces.length > 0 && (
+        {workspaces.length > 0 ? (
           <Select
             className="ws-switch"
             size="sm"
@@ -102,18 +104,35 @@ export function AppShell() {
             }))}
             onChange={(id) => {
               setActiveWorkspaceId(id);
+              if (loc.pathname === "/" || loc.pathname.startsWith("/t/")) {
+                nav(resolveWorkspaceTaskRoute(id));
+              }
             }}
             footer={
-              <button
-                type="button"
-                className="menu-item"
-                onClick={() => setFolderPickerOpen(true)}
-              >
-                <Icon name="plus" size={14} />
-                <span>{t("添加工作区…")}</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => setFolderPickerOpen(true)}
+                >
+                  <Icon name="plus" size={14} />
+                  <span>{t("添加工作区…")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => nav("/")}
+                >
+                  <Icon name="folder" size={14} />
+                  <span>管理工作区</span>
+                </button>
+              </>
             }
           />
+        ) : (
+          <Button size="sm" icon="folder" onClick={() => setFolderPickerOpen(true)}>
+            {t("添加工作区")}
+          </Button>
         )}
 
         <div ref={searchWrapRef} className="top-search">
@@ -309,7 +328,13 @@ export function AppShell() {
         <button
           type="button"
           className={cx(isTasksActive && "active")}
-          onClick={() => nav("/")}
+          onClick={() => {
+            if (workspaces.length === 0) {
+              nav("/");
+              return;
+            }
+            nav(resolveWorkspaceTaskRoute(activeWorkspace?.id));
+          }}
         >
           <Icon name="task" size={19} />
           <span>{t("任务")}</span>

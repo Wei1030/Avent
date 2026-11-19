@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SemanticState, TaskRecord } from "../../shared/types.js";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
@@ -40,12 +40,21 @@ export function SemanticStatePanel({
   // Dedicated History Modal (only shown when user clicks the subtle clock icon)
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyVer, setHistoryVer] = useState<number | null>(null);
+  const histDetailRef = useRef<HTMLDivElement>(null);
+
+  const isNewDraft = task.id === "__new__";
 
   useEffect(() => {
     setEditingObjective(false);
     setHistoryOpen(false);
     setHistoryVer(null);
   }, [task.id]);
+
+  useEffect(() => {
+    if (histDetailRef.current) {
+      histDetailRef.current.scrollTop = 0;
+    }
+  }, [historyVer, historyOpen]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -150,7 +159,7 @@ export function SemanticStatePanel({
                 {task.steeringDirectives.length > 0 && (
                   <span className="count">{task.steeringDirectives.length} 条约定</span>
                 )}
-                {!editingObjective && (
+                {!isNewDraft && !editingObjective && (
                   <button
                     type="button"
                     className="btn ghost sm icon-only"
@@ -170,7 +179,7 @@ export function SemanticStatePanel({
                 )}
               </div>
 
-              {editingObjective ? (
+              {!isNewDraft && editingObjective ? (
                 <div className="col" style={{ gap: 6 }}>
                   <textarea
                     autoFocus
@@ -198,7 +207,9 @@ export function SemanticStatePanel({
                 <div className="sstate-objective">{task.originalObjective}</div>
               ) : (
                 <div className="muted" style={{ fontSize: 12 }}>
-                  尚未明确具体目标。在左侧说明你的需求后，智能体会自动归纳并更新目标；也可以随时点击右上角铅笔手动设定。
+                  {isNewDraft
+                    ? "发送第一条消息后，智能体会自动归纳任务目标，并支持随时手动编辑目标或添加持久约定。"
+                    : "尚未明确具体目标。在左侧说明你的需求后，智能体会自动归纳并更新目标；也可以随时点击右上角铅笔手动设定。"}
                 </div>
               )}
 
@@ -233,25 +244,27 @@ export function SemanticStatePanel({
                 </div>
               )}
 
-              <div className="row" style={{ marginTop: 2 }}>
-                <input
-                  className="input sm"
-                  placeholder={t("添加持久约定（如：始终使用 npm.cmd）…")}
-                  value={directiveDraft}
-                  onChange={(e) => setDirectiveDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (isPlainEnter(e)) void handleAddDirective();
-                  }}
-                />
-                <Button
-                  size="sm"
-                  busy={addingRule}
-                  disabled={!directiveDraft.trim()}
-                  onClick={() => void handleAddDirective()}
-                >
-                  {t("添加")}
-                </Button>
-              </div>
+              {!isNewDraft && (
+                <div className="row" style={{ marginTop: 2 }}>
+                  <input
+                    className="input sm"
+                    placeholder={t("添加持久约定（如：始终使用 npm.cmd）…")}
+                    value={directiveDraft}
+                    onChange={(e) => setDirectiveDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (isPlainEnter(e)) void handleAddDirective();
+                    }}
+                  />
+                  <Button
+                    size="sm"
+                    busy={addingRule}
+                    disabled={!directiveDraft.trim()}
+                    onClick={() => void handleAddDirective()}
+                  >
+                    {t("添加")}
+                  </Button>
+                </div>
+              )}
             </section>
 
             {!latestState ? (
@@ -277,7 +290,7 @@ export function SemanticStatePanel({
       <Modal
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
-        wide
+        className="hist-modal"
         title="状态演进历史"
         subtitle={`共记录 ${states.length} 个阶段快照，点击左侧时间节点可回看当时沉淀的事实、计划与结论`}
         footer={<Button onClick={() => setHistoryOpen(false)}>关闭</Button>}
@@ -330,7 +343,7 @@ export function SemanticStatePanel({
             ))}
           </div>
 
-          <div className="hist-detail">
+          <div ref={histDetailRef} className="hist-detail">
             {selectedHistoryState && (
               <>
                 <section className="sstate-card">

@@ -360,6 +360,7 @@ export function Modal({
   title,
   subtitle,
   wide,
+  className,
   footer,
   children,
 }: {
@@ -368,6 +369,7 @@ export function Modal({
   title: ReactNode;
   subtitle?: ReactNode;
   wide?: boolean;
+  className?: string;
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -383,7 +385,7 @@ export function Modal({
   if (!open) return null;
   return createPortal(
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={cx("modal", wide && "wide")}>
+      <div className={cx("modal", wide && "wide", className)}>
         <div className="modal-head">
           <div className="grow">
             <h2>{title}</h2>

@@ -558,4 +558,62 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
+
+  it("cleans orphaned empty DRAFT tasks on startup, honors zero workspaces across restarts, and re-attaches tasks when re-adding a workspace", () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-ws-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    let store = new AventStore(dbDir, tmpDir);
+    try {
+      const ws = store.listWorkspaces()[0];
+      assert.ok(ws);
+
+      // Create 1 empty DRAFT task and 1 active task with a transcript item
+      const emptyDraft = store.createTask({
+        workspaceId: ws.id,
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        draft: true,
+      });
+      const realTask = store.createTask({
+        workspaceId: ws.id,
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        draft: false,
+        objective: "保留这个真实任务",
+      });
+      store.upsertTaskItem(realTask.id, {
+        id: "item-1",
+        kind: "user",
+        text: "保留这个真实任务",
+        attachments: [],
+        refs: [],
+        createdAt: new Date().toISOString(),
+      });
+
+      // Remove the only workspace -> 0 workspaces
+      store.deleteWorkspace(ws.id);
+      assert.equal(store.listWorkspaces().length, 0);
+      store.close();
+
+      // Re-open store with defaultWorkspacePath: must keep 0 workspaces and purge empty DRAFT
+      store = new AventStore(dbDir, tmpDir);
+      assert.equal(store.listWorkspaces().length, 0);
+      assert.equal(store.getTask(emptyDraft.id), null);
+      assert.ok(store.getTask(realTask.id));
+
+      // Re-add the folder -> historical task automatically re-attaches!
+      const reAdded = store.addWorkspace(tmpDir);
+      assert.equal(store.listWorkspaces().length, 1);
+      const reAttached = store.getTask(realTask.id)!;
+      assert.equal(reAttached.workspaceId, reAdded.id);
+      assert.equal(reAdded.taskCount, 1);
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
 });

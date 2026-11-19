@@ -7,19 +7,61 @@ import type {
   TaskRef,
 } from "../../shared/types.js";
 import { api } from "../api/client.js";
-import { useApp } from "../store/app-context.js";
+import { useApp, type NewTaskConfig } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
 import { ModelPicker, resolveThoughtLevelsForSelection } from "../components/ModelPicker.js";
 import { Button, Chip, Popover, Select } from "../components/ui.js";
 import { cx, isPlainEnter } from "../lib/format.js";
 
-export function Composer({ task }: { task: TaskRecord }) {
-  const { tasks, providers, endpoints, toast, t } = useApp();
-  const [text, setText] = useState("");
+export function Composer({
+  task,
+  draftKey,
+  isNewDraft = false,
+  onDraftConfigChange,
+  onCreatedTask,
+}: {
+  task: TaskRecord;
+  draftKey: string;
+  isNewDraft?: boolean;
+  onDraftConfigChange?: (patch: Partial<NewTaskConfig>) => void;
+  onCreatedTask?: (task: TaskRecord) => void;
+}) {
+  const {
+    tasks,
+    providers,
+    endpoints,
+    toast,
+    t,
+    getComposerDraft,
+    setComposerDraft,
+    clearComposerDraft,
+  } = useApp();
+
+  // Initialized from persistent draft store; TaskPage passes `key={draftKey}` so switching tasks
+  // cleanly remounts with the target task's saved unsent text, attachments, and refs.
+  const initialDraft = useMemo(() => getComposerDraft(draftKey), [draftKey, getComposerDraft]);
+  const [text, setTextState] = useState(initialDraft.text);
+  const [attachments, setAttachmentsState] = useState<AttachmentItem[]>(initialDraft.attachments);
+  const [refs, setRefsState] = useState<TaskRef[]>(initialDraft.refs);
   const [focused, setFocused] = useState(false);
-  const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
-  const [refs, setRefs] = useState<TaskRef[]>([]);
   const [sending, setSending] = useState(false);
+
+  // Latest values in ref so partial updates always persist the complete draft synchronously
+  const latestRef = useRef({ text, attachments, refs });
+  latestRef.current = { text, attachments, refs };
+
+  const updateDraft = (patch: Partial<{ text: string; attachments: AttachmentItem[]; refs: TaskRef[] }>) => {
+    const next = {
+      text: patch.text !== undefined ? patch.text : latestRef.current.text,
+      attachments: patch.attachments !== undefined ? patch.attachments : latestRef.current.attachments,
+      refs: patch.refs !== undefined ? patch.refs : latestRef.current.refs,
+    };
+    latestRef.current = next;
+    if (patch.text !== undefined) setTextState(patch.text);
+    if (patch.attachments !== undefined) setAttachmentsState(patch.attachments);
+    if (patch.refs !== undefined) setRefsState(patch.refs);
+    setComposerDraft(draftKey, next);
+  };
 
   // Autocomplete palettes (`@` for tasks & files, `/` for skills)
   const [atQuery, setAtQuery] = useState<string | null>(null);
@@ -32,7 +74,7 @@ export function Composer({ task }: { task: TaskRecord }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
 
-  const isRunning = task.status === "PULSING" || task.status === "WAITING_APPROVAL";
+  const isRunning = !isNewDraft && (task.status === "PULSING" || task.status === "WAITING_APPROVAL");
 
   useEffect(() => {
     if (!task.workspaceId) return;
@@ -50,7 +92,7 @@ export function Composer({ task }: { task: TaskRecord }) {
   }, [task.workspaceId]);
 
   const handleTextChange = (val: string) => {
-    setText(val);
+    updateDraft({ text: val });
     const slashM = /^\/([a-z0-9_-]*)$/i.exec(val);
     if (slashM) {
       setSlashQuery(slashM[1]);
@@ -85,34 +127,40 @@ export function Composer({ task }: { task: TaskRecord }) {
   }, [skills, slashQuery]);
 
   const insertTaskRef = (target: TaskRecord) => {
-    if (!refs.some((r) => r.taskId === target.id)) {
-      setRefs((prev) => [...prev, { taskId: target.id, title: target.title }]);
-    }
-    setText((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (m) => (m.startsWith(" ") ? " " : "")));
+    const nextRefs = refs.some((r) => r.taskId === target.id)
+      ? refs
+      : [...refs, { taskId: target.id, title: target.title }];
+    const nextText = latestRef.current.text.replace(/(?:^|\s)@([^\s@]*)$/, (m) =>
+      m.startsWith(" ") ? " " : ""
+    );
+    updateDraft({ text: nextText, refs: nextRefs });
     setAtQuery(null);
     textareaRef.current?.focus();
   };
 
   const insertFileAttachment = (filePath: string) => {
-    if (!attachments.some((a) => a.path === filePath)) {
-      setAttachments((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}_${filePath}`,
-          kind: "file",
-          name: filePath.split("/").pop() || filePath,
-          path: filePath,
-          meta: filePath,
-        },
-      ]);
-    }
-    setText((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (m) => (m.startsWith(" ") ? " " : "")));
+    const nextAtts = attachments.some((a) => a.path === filePath)
+      ? attachments
+      : [
+          ...attachments,
+          {
+            id: `${Date.now()}_${filePath}`,
+            kind: "file" as const,
+            name: filePath.split("/").pop() || filePath,
+            path: filePath,
+            meta: filePath,
+          },
+        ];
+    const nextText = latestRef.current.text.replace(/(?:^|\s)@([^\s@]*)$/, (m) =>
+      m.startsWith(" ") ? " " : ""
+    );
+    updateDraft({ text: nextText, attachments: nextAtts });
     setAtQuery(null);
     textareaRef.current?.focus();
   };
 
   const insertSkill = (s: SkillRecord) => {
-    setText(`/${s.name} `);
+    updateDraft({ text: `/${s.name} ` });
     setSlashQuery(null);
     textareaRef.current?.focus();
   };
@@ -122,14 +170,36 @@ export function Composer({ task }: { task: TaskRecord }) {
     if (!trimmed || sending) return;
     setSending(true);
     try {
+      if (isNewDraft) {
+        const res = await api.createTask({
+          workspaceId: task.workspaceId || undefined,
+          objective: trimmed,
+          providerId: task.providerId,
+          modelId: task.modelId,
+          thoughtLevel: task.thoughtLevel,
+          permissionMode: task.permissionMode,
+          attachments,
+          refs,
+        });
+        clearComposerDraft(draftKey);
+        setTextState("");
+        setAttachmentsState([]);
+        setRefsState([]);
+        setAtQuery(null);
+        setSlashQuery(null);
+        onCreatedTask?.(res.task);
+        return;
+      }
+
       const res = await api.sendMessage(task.id, {
         text: trimmed,
         attachments,
         refs,
       });
-      setText("");
-      setAttachments([]);
-      setRefs([]);
+      clearComposerDraft(draftKey);
+      setTextState("");
+      setAttachmentsState([]);
+      setRefsState([]);
       setAtQuery(null);
       setSlashQuery(null);
       if (res.queued) {
@@ -143,6 +213,7 @@ export function Composer({ task }: { task: TaskRecord }) {
   };
 
   const handleCancel = async () => {
+    if (isNewDraft) return;
     try {
       await api.cancelTask(task.id);
     } catch (err) {
@@ -162,7 +233,7 @@ export function Composer({ task }: { task: TaskRecord }) {
 
   return (
     <>
-      {task.queuedMessages && task.queuedMessages.length > 0 && (
+      {!isNewDraft && task.queuedMessages && task.queuedMessages.length > 0 && (
         <div className="queue">
           <div className="queue-head">排队等待发送（{task.queuedMessages.length}）</div>
           {task.queuedMessages.map((q) => (
@@ -189,7 +260,9 @@ export function Composer({ task }: { task: TaskRecord }) {
                 key={r.taskId}
                 tone="accent"
                 icon="link"
-                onRemove={() => setRefs((prev) => prev.filter((x) => x.taskId !== r.taskId))}
+                onRemove={() =>
+                  updateDraft({ refs: refs.filter((x) => x.taskId !== r.taskId) })
+                }
               >
                 引用任务：{r.title}
               </Chip>
@@ -200,7 +273,9 @@ export function Composer({ task }: { task: TaskRecord }) {
                 outline
                 mono
                 icon="file"
-                onRemove={() => setAttachments((prev) => prev.filter((x) => x.id !== a.id))}
+                onRemove={() =>
+                  updateDraft({ attachments: attachments.filter((x) => x.id !== a.id) })
+                }
               >
                 {a.path || a.name}
               </Chip>
@@ -229,7 +304,7 @@ export function Composer({ task }: { task: TaskRecord }) {
               className="menu-item"
               onClick={() => {
                 setPlusMenuOpen(false);
-                setText((prev) => (prev ? `${prev} @` : "@"));
+                updateDraft({ text: text ? `${text} @` : "@" });
                 setAtQuery("");
                 textareaRef.current?.focus();
               }}
@@ -245,7 +320,7 @@ export function Composer({ task }: { task: TaskRecord }) {
               className="menu-item"
               onClick={() => {
                 setPlusMenuOpen(false);
-                setText("/");
+                updateDraft({ text: "/" });
                 setSlashQuery("");
                 textareaRef.current?.focus();
               }}
@@ -263,7 +338,7 @@ export function Composer({ task }: { task: TaskRecord }) {
             className="c-input"
             rows={2}
             placeholder={
-              task.status === "DRAFT"
+              isNewDraft || task.status === "DRAFT"
                 ? "直接发消息聊聊或描述你的任务目标（输入 @ 引用其他任务或文件，输入 / 调用技能，Enter 发送）…"
                 : "继续对话或补充要求（输入 @ 引用其他任务结论或文件，Enter 发送）…"
             }
@@ -275,16 +350,18 @@ export function Composer({ task }: { task: TaskRecord }) {
               const pasted = e.clipboardData.getData("text");
               if (pasted && pasted.length > 900) {
                 e.preventDefault();
-                setAttachments((prev) => [
-                  ...prev,
-                  {
-                    id: `paste_${Date.now()}`,
-                    kind: "paste",
-                    name: `粘贴片段 (${pasted.split("\n").length} 行)`,
-                    meta: `${pasted.length} 字符`,
-                    content: pasted,
-                  },
-                ]);
+                updateDraft({
+                  attachments: [
+                    ...attachments,
+                    {
+                      id: `paste_${Date.now()}`,
+                      kind: "paste",
+                      name: `粘贴片段 (${pasted.split("\n").length} 行)`,
+                      meta: `${pasted.length} 字符`,
+                      content: pasted,
+                    },
+                  ],
+                });
               }
             }}
             onKeyDown={(e) => {
@@ -379,11 +456,19 @@ export function Composer({ task }: { task: TaskRecord }) {
               placement="top"
               borderless
               onSelect={(next) => {
-                void api.updateTask(task.id, {
-                  providerId: next.providerId,
-                  modelId: next.modelId,
-                  thoughtLevel: next.thoughtLevel,
-                });
+                if (isNewDraft) {
+                  onDraftConfigChange?.({
+                    providerId: next.providerId,
+                    modelId: next.modelId,
+                    thoughtLevel: next.thoughtLevel,
+                  });
+                } else {
+                  void api.updateTask(task.id, {
+                    providerId: next.providerId,
+                    modelId: next.modelId,
+                    thoughtLevel: next.thoughtLevel,
+                  });
+                }
               }}
             />
           )}
@@ -400,7 +485,11 @@ export function Composer({ task }: { task: TaskRecord }) {
                 label: `思考：${lv.name}`,
               }))}
               onChange={(thoughtLevel) => {
-                void api.updateTask(task.id, { thoughtLevel });
+                if (isNewDraft) {
+                  onDraftConfigChange?.({ thoughtLevel });
+                } else {
+                  void api.updateTask(task.id, { thoughtLevel });
+                }
               }}
             />
           )}
@@ -429,7 +518,11 @@ export function Composer({ task }: { task: TaskRecord }) {
               },
             ]}
             onChange={(permissionMode) => {
-              void api.updateTask(task.id, { permissionMode });
+              if (isNewDraft) {
+                onDraftConfigChange?.({ permissionMode });
+              } else {
+                void api.updateTask(task.id, { permissionMode });
+              }
             }}
           />
 

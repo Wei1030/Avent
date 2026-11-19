@@ -93,7 +93,7 @@ export const api = {
     title?: string;
     objective?: string;
     cwd?: string;
-    providerId?: ProviderId;
+    providerId?: TaskProviderId;
     modelId?: string;
     thoughtLevel?: string;
     permissionMode?: PermissionMode;

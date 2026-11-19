@@ -40,11 +40,9 @@ function groupBlocks(items: TranscriptItem[]): Array<TranscriptItem | StepItem[]
 export function TranscriptView({
   task,
   items,
-  onQuickPrompt,
 }: {
   task: TaskRecord;
   items: TranscriptItem[];
-  onQuickPrompt: (prompt: string) => void;
 }) {
   const nav = useNavigate();
   const { openFilePreview } = useApp();
@@ -57,23 +55,7 @@ export function TranscriptView({
         </div>
         <h2>开始一项新任务</h2>
         <div className="ink2">
-          直接描述你的需求。Avent 会在后台自动维护结构化的「状态记忆」，即使长链路多步骤任务也能始终保持清醒、准确且零上下文腐烂。
-        </div>
-        <div className="draft-prompts">
-          {[
-            "梳理当前项目的整体目录结构与核心模块职责",
-            "检查最近修改的代码并运行类型检查与测试验证",
-            "排查并解释本项目中多订阅驱动的连接流程",
-          ].map((p) => (
-            <button
-              key={p}
-              type="button"
-              className="draft-prompt-chip"
-              onClick={() => onQuickPrompt(p)}
-            >
-              {p}
-            </button>
-          ))}
+          直接输入你的想法或需求。Avent 会在后台自动维护结构化的「状态记忆」，在长链路多步骤任务中始终保持上下文清晰与准确。
         </div>
       </div>
     );

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
@@ -6,8 +7,19 @@ import { Button, Modal } from "../components/ui.js";
 import { cx, isPlainEnter } from "../lib/format.js";
 
 export function FolderPickerModal() {
-  const { folderPickerOpen, setFolderPickerOpen, setWorkspaces, setActiveWorkspaceId, toast, t } =
-    useApp();
+  const {
+    workspaces,
+    folderPickerOpen,
+    setFolderPickerOpen,
+    setWorkspaces,
+    setActiveWorkspaceId,
+    refreshBootstrap,
+    resolveWorkspaceTaskRoute,
+    toast,
+    t,
+  } = useApp();
+  const nav = useNavigate();
+  const loc = useLocation();
   const [currentPath, setCurrentPath] = useState("");
   const [manualInput, setManualInput] = useState("");
   const [parentPath, setParentPath] = useState<string | null>(null);
@@ -41,13 +53,18 @@ export function FolderPickerModal() {
   const handleConfirm = async () => {
     const chosen = manualInput.trim() || currentPath.trim();
     if (!chosen) return;
+    const wasEmpty = workspaces.length === 0;
     setSubmitting(true);
     try {
       const res = await api.addWorkspace(chosen);
       setWorkspaces(res.workspaces);
       setActiveWorkspaceId(res.workspace.id);
+      const fresh = await refreshBootstrap();
       setFolderPickerOpen(false);
       toast(`已添加工作区：${res.workspace.name}`, "good");
+      if (wasEmpty || loc.pathname.startsWith("/t/")) {
+        nav(resolveWorkspaceTaskRoute(res.workspace.id, fresh?.tasks));
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     } finally {

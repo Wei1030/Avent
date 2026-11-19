@@ -22,6 +22,7 @@ import type {
   McpToolSummary,
   PermissionMode,
   PermissionRuleRecord,
+  PersistedProviderCapabilities,
   ProviderId,
   PulseMode,
   PulseRecord,
@@ -29,6 +30,7 @@ import type {
   SemanticState,
   SkillRecord,
   SteeringDirective,
+  TaskProviderId,
   TaskRecord,
   TaskStatus,
   TranscriptItem,
@@ -129,7 +131,9 @@ export class AventStore {
         id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL DEFAULT '',
         title TEXT NOT NULL,
+        title_source TEXT NOT NULL DEFAULT 'auto',
         original_objective TEXT NOT NULL,
+        objective_source TEXT NOT NULL DEFAULT 'auto',
         completion_criteria_json TEXT NOT NULL,
         steering_json TEXT NOT NULL,
         tags_json TEXT NOT NULL DEFAULT '[]',
@@ -276,6 +280,12 @@ export class AventStore {
     }
     if (!colNames.has("total_tokens")) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;`);
+    }
+    if (!colNames.has("title_source")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN title_source TEXT NOT NULL DEFAULT 'auto';`);
+    }
+    if (!colNames.has("objective_source")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN objective_source TEXT NOT NULL DEFAULT 'auto';`);
     }
 
     // Seed default safety permission rules once if empty
@@ -577,7 +587,7 @@ export class AventStore {
     objective?: string;
     completionCriteria?: string[];
     cwd: string;
-    providerId: ProviderId;
+    providerId: TaskProviderId;
     modelId: string;
     thoughtLevel: string;
     permissionMode?: PermissionMode;
@@ -597,9 +607,10 @@ export class AventStore {
 
     const cleanObjective = (input.objective ?? "").trim();
     const isDraft = Boolean(input.draft) || cleanObjective.length === 0;
-    const title =
-      input.title?.trim() ||
-      (cleanObjective ? cleanObjective.split(/\r?\n/)[0].slice(0, 64) : "新任务");
+    const explicitTitle = input.title?.trim() || "";
+    const title = explicitTitle || "新任务";
+    const titleSource = explicitTitle ? "user" : "auto";
+    const objectiveSource = "auto";
     const criteria =
       input.completionCriteria && input.completionCriteria.length > 0
         ? input.completionCriteria
@@ -613,16 +624,19 @@ export class AventStore {
     this.db
       .prepare(
         `INSERT INTO tasks (
-          id, workspace_id, title, original_objective, completion_criteria_json, steering_json,
+          id, workspace_id, title, title_source, original_objective, objective_source,
+          completion_criteria_json, steering_json,
           tags_json, cwd, provider_id, model_id, thought_level, permission_mode, pulse_mode,
           status, current_version, pulse_count, total_tokens, latest_state_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)`
       )
       .run(
         id,
         wsId,
         title,
+        titleSource,
         cleanObjective,
+        objectiveSource,
         JSON.stringify(criteria),
         JSON.stringify([]),
         resolvedCwd,
@@ -639,23 +653,58 @@ export class AventStore {
     return this.getTask(id)!;
   }
 
-  public promoteDraftObjective(taskId: string, firstMessage: string): TaskRecord {
+  /**
+   * Transitions a DRAFT task into active IDLE status on first message WITHOUT
+   * prematurely locking raw first text (e.g. "你好") as the immutable objective.
+   * The model will determine a clean `taskTitle` and `taskObjective` once a real goal is stated.
+   */
+  public activateDraftTask(taskId: string): TaskRecord {
     const task = this.getTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
-    if (task.originalObjective.trim().length > 0 && task.status !== "DRAFT") {
-      return task;
+    if (task.status !== "DRAFT") return task;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`UPDATE tasks SET status = 'IDLE', updated_at = ? WHERE id = ?`)
+      .run(now, taskId);
+    return this.getTask(taskId)!;
+  }
+
+  public updateTaskObjectiveAndTitle(
+    taskId: string,
+    patch: { title?: string; objective?: string; source: "auto" | "user" }
+  ): TaskRecord {
+    const cur = this.getTask(taskId);
+    if (!cur) throw new Error(`Task not found: ${taskId}`);
+
+    let nextTitle = cur.title;
+    let nextTitleSource = cur.titleSource;
+    if (patch.title !== undefined) {
+      const trimmed = patch.title.trim().slice(0, 80);
+      if (trimmed && (patch.source === "user" || cur.titleSource !== "user")) {
+        nextTitle = trimmed;
+        nextTitleSource = patch.source;
+      }
     }
-    const clean = firstMessage.trim();
-    const nextTitle =
-      task.title === "新任务" || task.title === "New Task" || !task.title.trim()
-        ? clean.split(/\r?\n/)[0].slice(0, 64) || task.title
-        : task.title;
+
+    let nextObj = cur.originalObjective;
+    let nextObjSource = cur.objectiveSource;
+    if (patch.objective !== undefined) {
+      const trimmed = patch.objective.trim();
+      if (patch.source === "user") {
+        nextObj = trimmed;
+        nextObjSource = trimmed ? "user" : "auto";
+      } else if (trimmed && cur.objectiveSource !== "user") {
+        nextObj = trimmed;
+        nextObjSource = "auto";
+      }
+    }
+
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `UPDATE tasks SET title = ?, original_objective = ?, status = 'IDLE', updated_at = ? WHERE id = ?`
+        `UPDATE tasks SET title = ?, title_source = ?, original_objective = ?, objective_source = ?, updated_at = ? WHERE id = ?`
       )
-      .run(nextTitle, clean, now, taskId);
+      .run(nextTitle, nextTitleSource, nextObj, nextObjSource, now, taskId);
     return this.getTask(taskId)!;
   }
 
@@ -689,9 +738,10 @@ export class AventStore {
     taskId: string,
     patch: {
       title?: string;
+      originalObjective?: string;
       tags?: string[];
       permissionMode?: PermissionMode;
-      providerId?: ProviderId;
+      providerId?: TaskProviderId;
       modelId?: string;
       thoughtLevel?: string;
       pulseMode?: PulseMode;
@@ -700,10 +750,20 @@ export class AventStore {
     const cur = this.getTask(taskId);
     if (!cur) throw new Error(`Task not found: ${taskId}`);
     const now = new Date().toISOString();
+    const hasTitlePatch = patch.title !== undefined && patch.title.trim().length > 0;
+    const hasObjPatch = patch.originalObjective !== undefined;
+    const nextTitle = hasTitlePatch ? patch.title!.trim() : cur.title;
+    const nextTitleSource = hasTitlePatch ? "user" : cur.titleSource;
+    const nextObj = hasObjPatch ? patch.originalObjective!.trim() : cur.originalObjective;
+    const nextObjSource = hasObjPatch ? (nextObj ? "user" : "auto") : cur.objectiveSource;
+
     this.db
       .prepare(
         `UPDATE tasks SET
            title = ?,
+           title_source = ?,
+           original_objective = ?,
+           objective_source = ?,
            tags_json = ?,
            permission_mode = ?,
            provider_id = ?,
@@ -714,7 +774,10 @@ export class AventStore {
          WHERE id = ?`
       )
       .run(
-        patch.title?.trim() || cur.title,
+        nextTitle,
+        nextTitleSource,
+        nextObj,
+        nextObjSource,
         JSON.stringify(patch.tags ?? cur.tags),
         patch.permissionMode ?? cur.permissionMode,
         patch.providerId ?? cur.providerId,
@@ -729,7 +792,7 @@ export class AventStore {
 
   public updateTaskProvider(
     taskId: string,
-    providerId: ProviderId,
+    providerId: TaskProviderId,
     modelId: string,
     thoughtLevel: string,
     pulseMode?: PulseMode
@@ -737,13 +800,27 @@ export class AventStore {
     return this.updateTaskMeta(taskId, { providerId, modelId, thoughtLevel, pulseMode });
   }
 
-  public addSteeringDirective(taskId: string, directiveText: string): TaskRecord {
+  public addSteeringDirective(
+    taskId: string,
+    directiveText: string,
+    source: "user" | "model" = "user"
+  ): TaskRecord {
     const task = this.getTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
+    const clean = directiveText.trim();
+    if (!clean) return task;
+
+    // Deduplicate case-insensitively so repeated auto-extractions never spam duplicates
+    const normalized = clean.toLowerCase();
+    if (task.steeringDirectives.some((d) => d.directive.trim().toLowerCase() === normalized)) {
+      return task;
+    }
+
     const entry: SteeringDirective = {
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
-      directive: directiveText.trim(),
+      directive: clean,
+      source,
     };
     const updated = [...task.steeringDirectives, entry];
     const now = new Date().toISOString();
@@ -751,6 +828,25 @@ export class AventStore {
       .prepare(`UPDATE tasks SET steering_json = ?, updated_at = ? WHERE id = ?`)
       .run(JSON.stringify(updated), now, taskId);
     return this.getTask(taskId)!;
+  }
+
+  public listRecentUserMessages(taskId: string, limit = 4): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT item_json FROM task_items WHERE task_id = ? AND kind = 'user' ORDER BY seq DESC LIMIT ?`
+      )
+      .all(taskId, limit) as Array<{ item_json: string }>;
+    return rows
+      .reverse()
+      .map((r) => {
+        try {
+          const parsed = JSON.parse(r.item_json) as { text?: string };
+          return parsed.text?.trim() || "";
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
   }
 
   public removeSteeringDirective(taskId: string, directiveId: string): TaskRecord {
@@ -822,7 +918,7 @@ export class AventStore {
 
   public createPulse(input: {
     taskId: string;
-    providerId: ProviderId;
+    providerId: TaskProviderId;
     modelId: string;
     maxActions: number;
     netTokenLimit: number;
@@ -993,7 +1089,7 @@ export class AventStore {
   public commitSemanticState(
     taskId: string,
     pulseNumber: number,
-    providerId: ProviderId,
+    providerId: TaskProviderId,
     modelId: string,
     draft: Omit<SemanticState, "version" | "pulseNumber" | "providerId" | "modelId" | "createdAt">
   ): SemanticState {
@@ -1734,6 +1830,43 @@ export class AventStore {
     return merged;
   }
 
+  public saveProviderCapabilities(caps: PersistedProviderCapabilities): void {
+    const key = `provider_caps:${caps.providerId}`;
+    this.db
+      .prepare(
+        `INSERT INTO prefs (key, value_json) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`
+      )
+      .run(key, JSON.stringify(caps));
+  }
+
+  public getProviderCapabilities(providerId: ProviderId): PersistedProviderCapabilities | null {
+    const row = this.db
+      .prepare(`SELECT value_json FROM prefs WHERE key = ?`)
+      .get(`provider_caps:${providerId}`) as { value_json: string } | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value_json) as PersistedProviderCapabilities;
+    } catch {
+      return null;
+    }
+  }
+
+  public listProviderCapabilities(): PersistedProviderCapabilities[] {
+    const rows = this.db
+      .prepare(`SELECT value_json FROM prefs WHERE key LIKE 'provider_caps:%'`)
+      .all() as Array<{ value_json: string }>;
+    const out: PersistedProviderCapabilities[] = [];
+    for (const r of rows) {
+      try {
+        out.push(JSON.parse(r.value_json) as PersistedProviderCapabilities);
+      } catch {
+        // ignore malformed
+      }
+    }
+    return out;
+  }
+
   public listCompatibleEndpoints(): CompatibleEndpointRecord[] {
     const rows = this.db
       .prepare(`SELECT * FROM compatible_endpoints ORDER BY created_at DESC`)
@@ -1799,12 +1932,14 @@ export class AventStore {
       id: String(r.id),
       workspaceId: String(r.workspace_id || ""),
       title: String(r.title),
+      titleSource: (r.title_source === "user" ? "user" : "auto") as "auto" | "user",
       originalObjective: String(r.original_objective),
+      objectiveSource: (r.objective_source === "user" ? "user" : "auto") as "auto" | "user",
       completionCriteria: JSON.parse(String(r.completion_criteria_json)) as string[],
       steeringDirectives: JSON.parse(String(r.steering_json)) as SteeringDirective[],
       tags: r.tags_json ? (JSON.parse(String(r.tags_json)) as string[]) : [],
       cwd: String(r.cwd),
-      providerId: String(r.provider_id) as ProviderId,
+      providerId: String(r.provider_id) as TaskProviderId,
       modelId: String(r.model_id),
       thoughtLevel: String(r.thought_level),
       permissionMode: (r.permission_mode
@@ -1828,7 +1963,7 @@ export class AventStore {
       id: String(r.id),
       taskId: String(r.task_id),
       pulseNumber: Number(r.pulse_number),
-      providerId: String(r.provider_id) as ProviderId,
+      providerId: String(r.provider_id) as TaskProviderId,
       modelId: String(r.model_id),
       status: String(r.status) as PulseRecord["status"],
       actionCount: Number(r.action_count),

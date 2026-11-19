@@ -1,5 +1,11 @@
 export type ProviderId = "agy" | "claude" | "codex";
 
+/**
+ * Task execution provider identifier: either one of the built-in ACP subscription
+ * providers or a user-configured compatible endpoint (`endpoint:<id>`).
+ */
+export type TaskProviderId = ProviderId | `endpoint:${string}`;
+
 export type PulseMode = "micro-stretch" | "sac";
 
 export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions";
@@ -32,6 +38,7 @@ export interface SteeringDirective {
   id: string;
   timestamp: string;
   directive: string;
+  source?: "user" | "model";
 }
 
 export interface EstablishedFact {
@@ -64,7 +71,7 @@ export interface DeadEnd {
 export interface SemanticState {
   version: number;
   pulseNumber: number;
-  providerId: ProviderId;
+  providerId: TaskProviderId;
   modelId: string;
   createdAt: string;
   status: SemanticStatus;
@@ -78,6 +85,19 @@ export interface SemanticState {
   immediateNextAction: string;
   humanQuestion?: string;
 }
+
+/**
+ * Payload submitted by the model via `avent_commit_state` (or `<avent_state>` fallback).
+ * Includes optional model-determined taskTitle, taskObjective, and auto-extracted newDirectives.
+ */
+export type SemanticStateCommitDraft = Omit<
+  SemanticState,
+  "version" | "pulseNumber" | "providerId" | "modelId" | "createdAt"
+> & {
+  taskTitle?: string;
+  taskObjective?: string;
+  newDirectives?: string[];
+};
 
 export interface TaskRef {
   taskId: string;
@@ -188,12 +208,14 @@ export interface TaskRecord {
   id: string;
   workspaceId: string;
   title: string;
+  titleSource: "auto" | "user";
   originalObjective: string;
+  objectiveSource: "auto" | "user";
   completionCriteria: string[];
   steeringDirectives: SteeringDirective[];
   tags: string[];
   cwd: string;
-  providerId: ProviderId;
+  providerId: TaskProviderId;
   modelId: string;
   thoughtLevel: string;
   permissionMode: PermissionMode;
@@ -234,7 +256,7 @@ export interface PulseRecord {
   id: string;
   taskId: string;
   pulseNumber: number;
-  providerId: ProviderId;
+  providerId: TaskProviderId;
   modelId: string;
   status: "RUNNING" | "COMMITTED" | "FAILED" | "CANCELLED";
   actionCount: number;
@@ -252,9 +274,28 @@ export interface PulseRecord {
   traces?: PulseTraceEntry[];
 }
 
+export interface ThoughtLevelOption {
+  value: string;
+  name: string;
+}
+
 export interface ProviderModelOption {
   value: string;
   name: string;
+  /** Per-model thought levels discovered from ACP.
+   *  `undefined` = use provider default; `[]` = model has no independent thought-level selector. */
+  thoughtLevels?: ThoughtLevelOption[];
+  defaultThoughtLevel?: string;
+}
+
+export interface PersistedProviderCapabilities {
+  providerId: ProviderId;
+  tierName?: string;
+  models: ProviderModelOption[];
+  defaultModel?: string;
+  thoughtLevels?: ThoughtLevelOption[];
+  defaultThoughtLevel?: string;
+  probedAt: string;
 }
 
 export interface ProviderStatusInfo {
@@ -271,8 +312,9 @@ export interface ProviderStatusInfo {
   statusMessage: string;
   models: ProviderModelOption[];
   defaultModel: string;
-  thoughtLevels: ProviderModelOption[];
+  thoughtLevels: ThoughtLevelOption[];
   defaultThoughtLevel: string;
+  lastProbedAt?: string;
 }
 
 export interface McpToolSummary {
@@ -398,6 +440,7 @@ export interface TaskDetailResponse {
 
 export type LiveStreamEvent =
   | { type: "workspace_updated"; workspaces: WorkspaceRecord[] }
+  | { type: "providers_updated"; providers: ProviderStatusInfo[] }
   | { type: "task_updated"; task: TaskRecord }
   | { type: "task_deleted"; taskId: string }
   | { type: "item_upserted"; taskId: string; item: TranscriptItem }

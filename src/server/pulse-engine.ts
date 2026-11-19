@@ -11,9 +11,11 @@ import type {
   AttachmentItem,
   AventEvent,
   LiveStreamEvent,
+  ProviderId,
   PulseMode,
   QueuedMessage,
   SemanticState,
+  SemanticStateCommitDraft,
   TaskRecord,
   TaskRef,
   TranscriptItem,
@@ -197,8 +199,8 @@ export class PulseEngine {
     const taskBefore = this.store.getTask(taskId);
     if (!taskBefore) throw new Error(`Task not found: ${taskId}`);
 
-    const wasDraft = taskBefore.status === "DRAFT" || !taskBefore.originalObjective.trim();
-    const task = wasDraft ? this.store.promoteDraftObjective(taskId, rawText) : taskBefore;
+    const wasDraft = taskBefore.status === "DRAFT";
+    const task = wasDraft ? this.store.activateDraftTask(taskId) : taskBefore;
 
     const enrichedPrompt = this.buildEnrichedEventPayload(task, rawText, attachments, refs);
 
@@ -329,7 +331,7 @@ export class PulseEngine {
    */
   public commitStateFromMcp(
     pulseId: string,
-    draft: Omit<SemanticState, "version" | "pulseNumber" | "providerId" | "modelId" | "createdAt">
+    draft: SemanticStateCommitDraft
   ): { version: number; message: string } {
     const ctx = this.activeByPulse.get(pulseId);
     if (!ctx) {
@@ -345,25 +347,45 @@ export class PulseEngine {
     const task = this.store.getTask(ctx.taskId);
     if (!task) throw new Error(`Task not found: ${ctx.taskId}`);
 
+    // 1. Apply model-determined taskTitle & taskObjective (respects manual user locks)
+    if (draft.taskTitle?.trim() || draft.taskObjective?.trim()) {
+      this.store.updateTaskObjectiveAndTitle(ctx.taskId, {
+        title: draft.taskTitle,
+        objective: draft.taskObjective,
+        source: "auto",
+      });
+    }
+
+    // 2. Directly persist any durable rules/preferences detected by the model
+    if (Array.isArray(draft.newDirectives) && draft.newDirectives.length > 0) {
+      for (const dir of draft.newDirectives) {
+        if (typeof dir === "string" && dir.trim()) {
+          this.store.addSteeringDirective(ctx.taskId, dir.trim(), "model");
+        }
+      }
+    }
+
+    const { taskTitle: _tt, taskObjective: _to, newDirectives: _nd, ...stateFields } = draft;
+
     const prefs = this.store.getPreferences();
     const hasUnverifiedEdits =
       prefs.autoVerifyEdits &&
-      draft.appliedChanges.length > 0 &&
-      draft.appliedChanges.some((c) => !c.verified) &&
-      draft.verificationChecks.length === 0;
+      stateFields.appliedChanges.length > 0 &&
+      stateFields.appliedChanges.some((c) => !c.verified) &&
+      stateFields.verificationChecks.length === 0;
 
-    let adjustedDraft = draft;
+    let adjustedDraft = stateFields;
     let message = "Handoff recorded cleanly.";
-    if (draft.status === "COMPLETED" && hasUnverifiedEdits) {
+    if (stateFields.status === "COMPLETED" && hasUnverifiedEdits) {
       adjustedDraft = {
-        ...draft,
+        ...stateFields,
         status: "CONTINUE",
         remainingPlan: [
           "运行构建或测试验证刚刚完成的修改，确认无误后再标记已完成",
-          ...draft.remainingPlan,
+          ...stateFields.remainingPlan,
         ],
         immediateNextAction:
-          draft.immediateNextAction || "对已修改的文件执行测试或类型检查验证",
+          stateFields.immediateNextAction || "对已修改的文件执行测试或类型检查验证",
       };
       message =
         "Note: Unverified file changes detected without verificationChecks; downgraded status to CONTINUE so the next round verifies changes.";
@@ -434,11 +456,15 @@ export class PulseEngine {
       const projectInstructions = this.store.loadCombinedInstructionsForWorkspace(
         refreshedTask.cwd
       );
+      const recentUserMessages = refreshedTask.originalObjective.trim()
+        ? []
+        : this.store.listRecentUserMessages(taskId, 4);
       const workPrompt = buildPulseWorkPrompt(
         refreshedTask,
         currentEvent,
         budget,
-        projectInstructions
+        projectInstructions,
+        recentUserMessages
       );
       const compactionPrompt = buildPulseCompactionPrompt(refreshedTask);
 
@@ -467,6 +493,11 @@ export class PulseEngine {
       };
 
       try {
+        if (refreshedTask.providerId.startsWith("endpoint:")) {
+          throw new Error(
+            "当前兼容端点仅保存了模型配置，暂未绑定 ACP 执行驱动；请在底部模型选择器切换至 Google Antigravity / Claude Code / Codex 订阅执行。"
+          );
+        }
         const userMcpServers = this.store.listMcpServers(refreshedTask.workspaceId);
 
         const result = await executeAcpPulse(this.registry, {
@@ -478,7 +509,7 @@ export class PulseEngine {
           mcpBundlePath: this.mcpBundlePath,
           aventApiUrl: this.aventApiUrl,
           userMcpServers,
-          providerId: refreshedTask.providerId,
+          providerId: refreshedTask.providerId as ProviderId,
           modelId: refreshedTask.modelId,
           thoughtLevel: refreshedTask.thoughtLevel,
           maxActions: budget.maxActions,
@@ -493,6 +524,12 @@ export class PulseEngine {
           onFallbackCommit: (draft) => {
             this.commitStateFromMcp(pulse.id, draft);
             return ctx.committedState!;
+          },
+          onProvidersUpdated: () => {
+            this.broadcast({
+              type: "providers_updated",
+              providers: this.registry.listProviderStatuses(),
+            });
           },
           onCheckPermission: async (req) => {
             const latestTask = this.store.getTask(taskId) ?? refreshedTask;
@@ -785,7 +822,8 @@ function buildPulseWorkPrompt(
   task: TaskRecord,
   event: AventEvent,
   budget: { maxActions: number; netTokenLimit: number },
-  projectInstructions: string
+  projectInstructions: string,
+  recentUserMessages: string[] = []
 ): string {
   const steeringBlock =
     task.steeringDirectives.length > 0
@@ -816,19 +854,33 @@ function buildPulseWorkPrompt(
     ? `\n<project_instructions>\n${projectInstructions}\n</project_instructions>\n`
     : "";
 
-  return `You are operating inside **Avent**, a task-oriented engineering workbench powered by bounded context resets and structured Task State Memory (arXiv:2611.05306v1).
-Raw chat logs are NOT carried across execution rounds. Everything that persists is in \`<immutable_objective>\`, \`<persistent_directives>\`, and \`<current_task_state>\` below.
-${instructionsSection}
-<immutable_objective>
+  const hasObjective = task.originalObjective.trim().length > 0;
+  const objectiveSection = hasObjective
+    ? `<task_objective status="confirmed" source="${task.objectiveSource}">
 Task Title: ${task.title}
 Working Directory: ${task.cwd}
 
-Original Objective:
+Confirmed Objective:
 ${task.originalObjective}
 
 Completion Criteria:
 ${task.completionCriteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}
-</immutable_objective>
+</task_objective>`
+    : `<task_objective status="undecided">
+Task Title: ${task.title}
+Working Directory: ${task.cwd}
+
+Objective Status: UNDECIDED (待明确) — No concrete task goal has been established yet.${
+        recentUserMessages.length > 0
+          ? `\nRecent User Messages:\n${recentUserMessages.map((m, i) => `${i + 1}. ${m}`).join("\n")}`
+          : ""
+      }
+</task_objective>`;
+
+  return `You are operating inside **Avent**, a task-oriented engineering workbench powered by bounded context resets and structured Task State Memory (arXiv:2611.05306v1).
+Raw chat logs are NOT carried across execution rounds. Everything that persists is in \`<task_objective>\`, \`<persistent_directives>\`, and \`<current_task_state>\` below.
+${instructionsSection}
+${objectiveSection}
 
 <persistent_directives>
 ${steeringBlock}
@@ -846,10 +898,16 @@ ${event.payload}
 1. **Bounded Actions & Selective Reading**: Take at most **${budget.maxActions}** external tool call(s) in this round. Prefer \`avent_doc_grep\` and \`avent_doc_read\` for large files, and \`avent_history_grep\` if you ever need raw logs from an earlier round.
 2. **Respect Excluded Dead-Ends**: Do NOT repeat approaches listed in \`deadEnds\`. Separate verified facts (\`establishedFacts\` with exact \`path#Lstart-Lend\` pointers) from unverified \`openHypotheses\`.
 3. **Natural User Communication**: Write clear, natural responses in the user's language. NEVER mention internal implementation jargon such as "pulse", "micro-session", "SSSM", or "watermark" to the user.
-4. **Completion & State Commit**:
+4. **Task Title, Objective & Durable Directives (Automatic State Maintenance)**:
+   - **\`taskTitle\` & \`taskObjective\`**:
+     - If \`<task_objective>\` is \`undecided\` AND the user only sent a greeting or small talk (e.g. "你好", "hi", "在吗") without stating a concrete task, **LEAVE \`taskObjective\` OMITTED/EMPTY** so it stays undecided, reply warmly, and set \`status = "WAITING_HUMAN"\`.
+     - As soon as the user expresses a concrete engineering/analysis goal, distill a concise \`taskTitle\` (6–24 chars) and clear \`taskObjective\` in \`avent_commit_state\`.
+     - If \`<task_objective>\` is already confirmed and the user explicitly expands or pivots scope, you may refine \`taskObjective\` (Avent automatically preserves user-locked edits).
+   - **\`newDirectives\`**: Whenever the user expresses a durable preference, constraint, or standing rule for this task (e.g. "不要动迁移文件", "始终使用中文回复", "用 npm.cmd 执行命令"), include it directly in \`newDirectives\` in \`avent_commit_state\` — no need to ask permission first (the user can delete any directive in one click). Do NOT repeat rules already listed in \`<persistent_directives>\`.
+5. **Completion & State Commit**:
    - Write your helpful response for the user, and before ending your turn call \`avent_commit_state\` (from the \`avent\` MCP server):
-     - \`status = "COMPLETED"\` when the user's task/request is satisfied and any code edits are verified.
-     - \`status = "WAITING_HUMAN"\` when you answered a question and are ready for follow-up, or need user input.
+     - \`status = "COMPLETED"\` when the user's concrete task/request is satisfied and any code edits are verified.
+     - \`status = "WAITING_HUMAN"\` when you answered a greeting/question and await follow-up, or need user clarification.
      - \`status = "CONTINUE"\` when autonomous steps remain beyond this ${budget.maxActions}-action round; fill \`remainingPlan\` and \`immediateNextAction\`.
    - Once \`avent_commit_state\` succeeds, stop calling tools and end your turn immediately.
 </execution_guidelines>`;
@@ -859,11 +917,13 @@ function buildPulseCompactionPrompt(task: TaskRecord): string {
   return `External workspace tools are now paused for this round so your progress on "${task.title}" can be saved into Task State Memory.
 Call the MCP tool \`avent_commit_state\` RIGHT NOW (do NOT call bash, file, or search tools):
 1. \`status\`: "COMPLETED" if satisfied, "WAITING_HUMAN" if awaiting user follow-up/decision, or "CONTINUE" if more autonomous steps remain.
-2. \`deliverableSummary\`: Clean, natural response or progress summary for the user (in the user's language; do NOT use internal terms like pulse/micro-session/SSSM).
-3. \`establishedFacts\`: Verified observations with exact \`file#line\` pointers.
-4. \`appliedChanges\` & \`verificationChecks\`: Modified files and check outcomes.
-5. \`deadEnds\`: Approaches ruled out.
-6. \`remainingPlan\` & \`immediateNextAction\`: Remaining steps and exact next action if status="CONTINUE".
+2. \`taskTitle\` & \`taskObjective\`: Set concise title and distilled objective if a concrete goal is clear (leave \`taskObjective\` empty if user only sent a greeting without a concrete goal).
+3. \`newDirectives\`: Any NEW durable user constraints/preferences expressed in this turn that are not yet in \`<persistent_directives>\`.
+4. \`deliverableSummary\`: Clean, natural response or progress summary for the user (in the user's language; do NOT use internal terms like pulse/micro-session/SSSM).
+5. \`establishedFacts\`: Verified observations with exact \`file#line\` pointers.
+6. \`appliedChanges\` & \`verificationChecks\`: Modified files and check outcomes.
+7. \`deadEnds\`: Approaches ruled out.
+8. \`remainingPlan\` & \`immediateNextAction\`: Remaining steps and exact next action if status="CONTINUE".
 
 (Fallback only if \`avent_commit_state\` is unreachable: output \`<avent_state>{ ...valid JSON... }</avent_state>\`.)`;
 }

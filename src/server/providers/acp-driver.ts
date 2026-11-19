@@ -12,6 +12,7 @@ import type {
   ProviderId,
   PulseTraceEntry,
   SemanticState,
+  SemanticStateCommitDraft,
   TranscriptToolOutput,
 } from "../../shared/types.js";
 
@@ -93,9 +94,8 @@ export interface ExecuteAcpPulseInput {
   workPrompt: string;
   compactionPrompt: string;
   getCommittedState: () => SemanticState | null;
-  onFallbackCommit: (
-    draft: Omit<SemanticState, "version" | "pulseNumber" | "providerId" | "modelId" | "createdAt">
-  ) => SemanticState;
+  onFallbackCommit: (draft: SemanticStateCommitDraft) => SemanticState;
+  onProvidersUpdated?: () => void;
   onCheckPermission?: (req: ToolPermissionCheckInput) => Promise<ToolPermissionCheckResult>;
   onThoughtDelta?: (delta: string) => void;
   onAssistantDelta?: (delta: string) => void;
@@ -680,32 +680,66 @@ export async function executeAcpPulse(
         const agyMeta = (newSessionRes._meta as Record<string, unknown> | undefined)?.antigravity as
           | { tier?: { name?: string } }
           | undefined;
-        if (agyMeta?.tier?.name) {
-          registry.recordObservedTier(input.providerId, agyMeta.tier.name);
+        const observedTier = agyMeta?.tier?.name;
+        let capsChanged = false;
+
+        let activeConfigOptions = newSessionRes.configOptions ?? [];
+        const initModelOpt = activeConfigOptions.find(
+          (o) => o.type === "select" && (o.id === "model" || o.category === "model")
+        );
+        if (
+          registry.recordObservedConfigOptions(
+            input.providerId,
+            initModelOpt && initModelOpt.type === "select" ? initModelOpt.currentValue : undefined,
+            activeConfigOptions,
+            observedTier
+          )
+        ) {
+          capsChanged = true;
         }
 
-        const configOptions = newSessionRes.configOptions ?? [];
-        const modelOpt = configOptions.find((o) => o.id === "model" || o.category === "model");
         if (
-          modelOpt &&
-          modelOpt.type === "select" &&
+          initModelOpt &&
+          initModelOpt.type === "select" &&
           input.modelId &&
           input.modelId !== "default"
         ) {
-          const flatValues = modelOpt.options.flatMap((item) =>
+          const flatValues = initModelOpt.options.flatMap((item) =>
             "options" in item ? item.options.map((sub) => sub.value) : [item.value]
           );
           if (flatValues.includes(input.modelId)) {
-            await agent.request(acp.methods.agent.session.setConfigOption, {
+            const upd = await agent.request(acp.methods.agent.session.setConfigOption, {
               sessionId: activeSessionId,
-              configId: modelOpt.id,
+              configId: initModelOpt.id,
               value: input.modelId,
             });
+            if (upd.configOptions && upd.configOptions.length > 0) {
+              activeConfigOptions = upd.configOptions;
+              if (
+                registry.recordObservedConfigOptions(
+                  input.providerId,
+                  input.modelId,
+                  activeConfigOptions,
+                  observedTier
+                )
+              ) {
+                capsChanged = true;
+              }
+            }
           }
         }
 
-        const thoughtOpt = configOptions.find(
-          (o) => o.id === "thought_level" || o.category === "thought_level"
+        if (capsChanged) {
+          input.onProvidersUpdated?.();
+        }
+
+        const thoughtOpt = activeConfigOptions.find(
+          (o) =>
+            o.type === "select" &&
+            (o.id === "thought_level" ||
+              o.category === "thought_level" ||
+              o.id === "reasoning_effort" ||
+              o.id === "thinking_level")
         );
         if (thoughtOpt && thoughtOpt.type === "select" && input.thoughtLevel) {
           const flatValues = thoughtOpt.options.flatMap((item) =>
@@ -820,9 +854,7 @@ export function stripAventStateTag(text: string): string {
   return text.replace(/<avent_state>[\s\S]*?<\/avent_state>/gi, "").trim();
 }
 
-function tryExtractFallbackStateJson(
-  text: string
-): Omit<SemanticState, "version" | "pulseNumber" | "providerId" | "modelId" | "createdAt"> | null {
+function tryExtractFallbackStateJson(text: string): SemanticStateCommitDraft | null {
   const match =
     text.match(/<avent_state>([\s\S]*?)<\/avent_state>/i) ||
     text.match(/```json\s*([\s\S]*?)```/i);
@@ -838,6 +870,11 @@ function tryExtractFallbackStateJson(
       : "WAITING_HUMAN";
     return {
       status,
+      taskTitle: typeof obj.taskTitle === "string" ? obj.taskTitle : undefined,
+      taskObjective: typeof obj.taskObjective === "string" ? obj.taskObjective : undefined,
+      newDirectives: Array.isArray(obj.newDirectives)
+        ? obj.newDirectives.filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+        : undefined,
       deliverableSummary: obj.deliverableSummary,
       establishedFacts: Array.isArray(obj.establishedFacts) ? obj.establishedFacts : [],
       openHypotheses: Array.isArray(obj.openHypotheses) ? obj.openHypotheses : [],

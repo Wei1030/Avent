@@ -335,4 +335,191 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
+
+  it("keeps objective undecided on greeting, lets model set title/objective & auto-add directives, and persists per-model thoughtLevels", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-meta-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    const store = new AventStore(dbDir, tmpDir);
+    try {
+      // 1. Verify persisted provider capabilities with per-model thoughtLevels survive reload
+      store.saveProviderCapabilities({
+        providerId: "agy",
+        tierName: "Google AI Ultra",
+        defaultModel: "gemini-4-neon",
+        defaultThoughtLevel: "high",
+        probedAt: new Date().toISOString(),
+        models: [
+          {
+            value: "gemini-4-neon",
+            name: "Gemini 4 Neon",
+            thoughtLevels: [
+              { value: "low", name: "低 (Low)" },
+              { value: "high", name: "高 (High)" },
+              { value: "xhigh", name: "极高 (Extra)" },
+            ],
+            defaultThoughtLevel: "high",
+          },
+          {
+            value: "gemini-pro-orchestrator-neon",
+            name: "Orchestrator (Neon)",
+            thoughtLevels: [],
+          },
+        ],
+      });
+
+      const reloadedRegistry = new ProviderRegistry(process.cwd(), store);
+      const agyStatus = reloadedRegistry.listProviderStatuses().find((p) => p.id === "agy")!;
+      assert.equal(agyStatus.tierName, "Google AI Ultra");
+      assert.equal(agyStatus.defaultModel, "gemini-4-neon");
+      const neon = agyStatus.models.find((m) => m.value === "gemini-4-neon")!;
+      assert.ok(neon.thoughtLevels?.some((l) => l.value === "xhigh"));
+      const orch = agyStatus.models.find((m) => m.value === "gemini-pro-orchestrator-neon")!;
+      assert.deepEqual(orch.thoughtLevels, []);
+
+      // 2. Verify undecided objective on greeting -> model sets title/objective & newDirectives on Turn 2
+      const seenPrompts: string[] = [];
+      const engine = new PulseEngine({
+        store,
+        registry: reloadedRegistry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        mockAgentFactory: (_task, pulseNumber) =>
+          acp
+            .agent({ name: `mock-meta-${pulseNumber}` })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock-acp", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async () => ({
+              sessionId: `sess-meta-${pulseNumber}`,
+            }))
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              const promptText =
+                ctx.params.prompt[0]?.type === "text" ? ctx.params.prompt[0].text : "";
+              seenPrompts.push(promptText);
+
+              const statePayload =
+                pulseNumber === 1
+                  ? {
+                      status: "WAITING_HUMAN",
+                      deliverableSummary: "你好！请问今天想一起处理什么任务？",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    }
+                  : pulseNumber === 2
+                    ? {
+                        status: "WAITING_HUMAN",
+                        taskTitle: "调整登录会话超时配置",
+                        taskObjective: "将登录超时修改为 30 分钟并补充单测",
+                        newDirectives: ["不要修改数据库迁移文件", "始终使用 npm.cmd 运行测试"],
+                        deliverableSummary: "明白，我已记录目标与约定，接下来开始排查配置。",
+                        establishedFacts: [],
+                        openHypotheses: [],
+                        appliedChanges: [],
+                        verificationChecks: [],
+                        deadEnds: [],
+                        remainingPlan: [],
+                        immediateNextAction: "",
+                      }
+                    : {
+                        status: "COMPLETED",
+                        taskTitle: "尝试覆盖用户标题",
+                        taskObjective: "尝试覆盖用户锁定的目标",
+                        newDirectives: ["始终使用 npm.cmd 运行测试"], // duplicate should be ignored
+                        deliverableSummary: "已完成！",
+                        establishedFacts: [],
+                        openHypotheses: [],
+                        appliedChanges: [],
+                        verificationChecks: [],
+                        deadEnds: [],
+                        remainingPlan: [],
+                        immediateNextAction: "",
+                      };
+
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify(statePayload)}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const task = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "xhigh",
+        permissionMode: "bypassPermissions",
+        draft: true,
+      });
+
+      const waitForPulse = (num: number) =>
+        new Promise<void>((resolve) => {
+          const unsub = engine.subscribe((ev) => {
+            if (ev.type === "pulse_finished" && ev.taskId === task.id && ev.pulse.pulseNumber === num) {
+              unsub();
+              setTimeout(resolve, 20);
+            }
+          });
+        });
+
+      // Turn 1: User greets with "你好" -> objective MUST stay undecided!
+      const p1 = waitForPulse(1);
+      engine.sendUserMessage(task.id, { text: "你好" });
+      await p1;
+
+      const afterGreeting = store.getTask(task.id)!;
+      assert.equal(afterGreeting.originalObjective, "");
+      assert.equal(afterGreeting.title, "新任务");
+      assert.ok(seenPrompts[0].includes('status="undecided"'));
+
+      // Turn 2: User states concrete task + durable constraints -> model sets title, objective & newDirectives
+      const p2 = waitForPulse(2);
+      engine.sendUserMessage(task.id, {
+        text: "帮我把登录超时改成 30 分钟并补单测。注意不要动迁移文件，始终用 npm.cmd 跑测试。",
+      });
+      await p2;
+
+      const afterTurn2 = store.getTask(task.id)!;
+      assert.equal(afterTurn2.title, "调整登录会话超时配置");
+      assert.equal(afterTurn2.originalObjective, "将登录超时修改为 30 分钟并补充单测");
+      assert.equal(afterTurn2.steeringDirectives.length, 2);
+      assert.equal(afterTurn2.steeringDirectives[0].source, "model");
+
+      // User manually locks objective & title -> Turn 3 model attempt to overwrite must be ignored, duplicate directive ignored
+      store.updateTaskMeta(task.id, {
+        title: "用户手动定名",
+        originalObjective: "用户手动锁定的精准目标",
+      });
+
+      const p3 = waitForPulse(3);
+      engine.sendUserMessage(task.id, { text: "继续完成吧" });
+      await p3;
+
+      // Turn 3 prompt must include the model-extracted persistent directives!
+      assert.ok(seenPrompts[2].includes("不要修改数据库迁移文件"));
+      assert.ok(seenPrompts[2].includes("始终使用 npm.cmd 运行测试"));
+
+      const afterTurn3 = store.getTask(task.id)!;
+      assert.equal(afterTurn3.title, "用户手动定名");
+      assert.equal(afterTurn3.originalObjective, "用户手动锁定的精准目标");
+      assert.equal(afterTurn3.steeringDirectives.length, 2); // deduplicated!
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
 });

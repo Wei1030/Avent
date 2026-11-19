@@ -10,6 +10,7 @@ import {
 import type {
   AppPreferences,
   ApprovalRequest,
+  CompatibleEndpointRecord,
   LiveStreamEvent,
   ProviderStatusInfo,
   TaskDetailResponse,
@@ -43,6 +44,7 @@ interface AppContextValue {
   tasks: TaskRecord[];
   approvals: ApprovalRequest[];
   providers: ProviderStatusInfo[];
+  endpoints: CompatibleEndpointRecord[];
   prefs: AppPreferences;
   lang: "zh-CN" | "en";
   t: (key: string, vars?: Record<string, string | number>) => string;
@@ -51,6 +53,7 @@ interface AppContextValue {
   refreshBootstrap: () => Promise<void>;
   updatePrefs: (patch: Partial<AppPreferences>) => Promise<void>;
   setProviders: (list: ProviderStatusInfo[]) => void;
+  setEndpoints: (list: CompatibleEndpointRecord[]) => void;
   setWorkspaces: (list: WorkspaceRecord[]) => void;
   toast: (text: string, tone?: ToastItem["tone"]) => void;
   dismissToast: (id: string) => void;
@@ -84,6 +87,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [providers, setProviders] = useState<ProviderStatusInfo[]>([]);
+  const [endpoints, setEndpoints] = useState<CompatibleEndpointRecord[]>([]);
   const [prefs, setPrefs] = useState<AppPreferences>(DEFAULT_PREFS);
   const [taskDetails, setTaskDetails] = useState<Record<string, TaskDetailResponse>>({});
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -122,6 +126,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setTasks(data.tasks);
       setApprovals(data.approvals);
       setProviders(data.providers);
+      setEndpoints(data.endpoints ?? []);
       setPrefs(data.prefs);
       setActiveWsState((cur) => {
         if (cur && data.workspaces.some((w) => w.id === cur)) return cur;
@@ -185,6 +190,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       switch (ev.type) {
         case "workspace_updated":
           setWorkspaces(ev.workspaces);
+          break;
+
+        case "providers_updated":
+          setProviders(ev.providers);
           break;
 
         case "task_updated": {
@@ -311,6 +320,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tasks,
       approvals,
       providers,
+      endpoints,
       prefs,
       lang,
       t,
@@ -319,6 +329,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshBootstrap,
       updatePrefs,
       setProviders,
+      setEndpoints,
       setWorkspaces,
       toast,
       dismissToast,
@@ -339,6 +350,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tasks,
       approvals,
       providers,
+      endpoints,
       prefs,
       lang,
       t,

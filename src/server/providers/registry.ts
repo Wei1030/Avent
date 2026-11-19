@@ -3,7 +3,14 @@ import path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
-import type { ProviderId, ProviderModelOption, ProviderStatusInfo } from "../../shared/types.js";
+import type { AventStore } from "../db.js";
+import type {
+  PersistedProviderCapabilities,
+  ProviderId,
+  ProviderModelOption,
+  ProviderStatusInfo,
+  ThoughtLevelOption,
+} from "../../shared/types.js";
 
 export interface ProviderLaunchSpec {
   id: ProviderId;
@@ -11,6 +18,59 @@ export interface ProviderLaunchSpec {
   args: string[];
   env: Record<string, string>;
   info: ProviderStatusInfo;
+}
+
+const THOUGHT_LABEL_MAP: Record<string, string> = {
+  off: "关闭 (Off)",
+  none: "关闭 (None)",
+  minimal: "极简 (Minimal)",
+  low: "低 (Low)",
+  medium: "中 (Medium)",
+  high: "高 (High)",
+  xhigh: "极高 (Extra)",
+  max: "最高 (Max)",
+};
+
+export function formatThoughtLevelLabel(value: string, fallbackName?: string): string {
+  const mapped = THOUGHT_LABEL_MAP[value.toLowerCase()];
+  if (mapped) return mapped;
+  return fallbackName && fallbackName !== value ? `${fallbackName} (${value})` : value;
+}
+
+function findThoughtConfigOption(configOptions: acp.SessionConfigOption[] | undefined) {
+  return (configOptions ?? []).find(
+    (o) =>
+      o.type === "select" &&
+      (o.id === "thought_level" ||
+        o.category === "thought_level" ||
+        o.id === "reasoning_effort" ||
+        o.id === "thinking_level")
+  );
+}
+
+function extractSelectOptions(
+  opt: acp.SessionConfigOption | undefined
+): Array<{ value: string; name: string }> {
+  if (!opt || opt.type !== "select") return [];
+  return opt.options.flatMap((item) =>
+    "options" in item
+      ? item.options.map((sub) => ({ value: sub.value, name: sub.name }))
+      : [{ value: item.value, name: item.name }]
+  );
+}
+
+function extractThoughtLevelsFromConfig(
+  configOptions: acp.SessionConfigOption[] | undefined
+): { levels: ThoughtLevelOption[]; currentValue?: string } {
+  const tl = findThoughtConfigOption(configOptions);
+  if (!tl || tl.type !== "select") {
+    return { levels: [] };
+  }
+  const levels = extractSelectOptions(tl).map((o) => ({
+    value: o.value,
+    name: formatThoughtLevelLabel(o.value, o.name),
+  }));
+  return { levels, currentValue: tl.currentValue };
 }
 
 function findExecutableOnWindowsOrPosix(
@@ -86,20 +146,118 @@ function killProc(proc: ChildProcess): void {
 
 export class ProviderRegistry {
   private projectRoot: string;
-  private cachedTierByProvider = new Map<ProviderId, string>();
-  private cachedModelsByProvider = new Map<ProviderId, ProviderModelOption[]>();
+  private store?: AventStore;
+  private capsByProvider = new Map<ProviderId, PersistedProviderCapabilities>();
   private verifiedLive = new Set<ProviderId>(["agy"]);
   private binCache: { at: number; agy?: string; claude?: string; codex?: string } | null = null;
+  private probingInFlight = new Map<ProviderId, Promise<{ ok: boolean; status: ProviderStatusInfo; detail: string }>>();
 
-  constructor(projectRoot: string) {
+  constructor(projectRoot: string, store?: AventStore) {
     this.projectRoot = projectRoot;
+    this.store = store;
+
+    // Hydrate persisted capabilities from SQLite immediately so restarts retain live models & thought levels
+    if (this.store) {
+      for (const cap of this.store.listProviderCapabilities()) {
+        this.capsByProvider.set(cap.providerId, cap);
+        this.verifiedLive.add(cap.providerId);
+      }
+    }
+  }
+
+  public hasPersistedCapabilities(providerId: ProviderId): boolean {
+    return this.capsByProvider.has(providerId);
   }
 
   public recordObservedTier(providerId: ProviderId, tierName: string): void {
-    if (tierName) {
-      this.cachedTierByProvider.set(providerId, tierName);
-      this.verifiedLive.add(providerId);
+    if (!tierName) return;
+    this.verifiedLive.add(providerId);
+    const existing = this.capsByProvider.get(providerId);
+    if (existing) {
+      if (existing.tierName !== tierName) {
+        const updated: PersistedProviderCapabilities = {
+          ...existing,
+          tierName,
+          probedAt: new Date().toISOString(),
+        };
+        this.capsByProvider.set(providerId, updated);
+        this.store?.saveProviderCapabilities(updated);
+      }
     }
+  }
+
+  /**
+   * Opportunistically merges live `configOptions` returned during normal task `session/new`
+   * or `session/set_config_option` calls and persists them into SQLite.
+   */
+  public recordObservedConfigOptions(
+    providerId: ProviderId,
+    activeModelId: string | undefined,
+    configOptions: acp.SessionConfigOption[] | undefined,
+    tierName?: string
+  ): boolean {
+    if (!configOptions || configOptions.length === 0) {
+      if (tierName) this.recordObservedTier(providerId, tierName);
+      return false;
+    }
+
+    const existing = this.capsByProvider.get(providerId);
+    const modelOpt = configOptions.find(
+      (o) => o.type === "select" && (o.id === "model" || o.category === "model")
+    );
+    const extractedModels = extractSelectOptions(modelOpt);
+    const thought = extractThoughtLevelsFromConfig(configOptions);
+
+    // Build merged models list preserving previously discovered per-model thoughtLevels
+    const prevByVal = new Map((existing?.models ?? []).map((m) => [m.value, m]));
+    const baseModels: ProviderModelOption[] =
+      extractedModels.length > 0
+        ? extractedModels.map((m) => {
+            const prev = prevByVal.get(m.value);
+            return {
+              value: m.value,
+              name: m.name,
+              thoughtLevels: prev?.thoughtLevels,
+              defaultThoughtLevel: prev?.defaultThoughtLevel,
+            };
+          })
+        : [...(existing?.models ?? [])];
+
+    const currentModelVal =
+      activeModelId ||
+      (modelOpt && modelOpt.type === "select" ? modelOpt.currentValue : undefined);
+
+    if (currentModelVal && baseModels.length > 0) {
+      const idx = baseModels.findIndex((m) => m.value === currentModelVal);
+      if (idx >= 0) {
+        baseModels[idx] = {
+          ...baseModels[idx],
+          thoughtLevels: thought.levels,
+          defaultThoughtLevel: thought.currentValue,
+        };
+      }
+    }
+
+    const nextCaps: PersistedProviderCapabilities = {
+      providerId,
+      tierName: tierName || existing?.tierName,
+      models: baseModels.length > 0 ? baseModels : existing?.models ?? [],
+      defaultModel:
+        (modelOpt && modelOpt.type === "select" && modelOpt.currentValue) ||
+        existing?.defaultModel,
+      thoughtLevels:
+        thought.levels.length > 0 ? thought.levels : existing?.thoughtLevels,
+      defaultThoughtLevel: thought.currentValue || existing?.defaultThoughtLevel,
+      probedAt: new Date().toISOString(),
+    };
+
+    const changed = JSON.stringify(existing) !== JSON.stringify(nextCaps);
+    this.capsByProvider.set(providerId, nextCaps);
+    this.verifiedLive.add(providerId);
+    if (changed) {
+      this.store?.saveProviderCapabilities(nextCaps);
+    }
+    return changed;
   }
 
   public getLaunchSpec(providerId: ProviderId): ProviderLaunchSpec {
@@ -116,10 +274,25 @@ export class ProviderRegistry {
   }
 
   /**
-   * Performs a non-invasive ACP handshake (`initialize` + `session/new` + `session/close`)
-   * to confirm subscription status and discover live model options.
+   * Performs a live ACP handshake (`initialize` + `session/new`), probes every available
+   * model's supported `thought_level` / `reasoning_effort` options in one session, closes
+   * cleanly (`session/close`), and persists the full capability matrix to SQLite.
    */
   public async probeProvider(
+    providerId: ProviderId,
+    cwd?: string
+  ): Promise<{ ok: boolean; status: ProviderStatusInfo; detail: string }> {
+    const inflight = this.probingInFlight.get(providerId);
+    if (inflight) return inflight;
+
+    const job = this.runProbeProvider(providerId, cwd).finally(() => {
+      this.probingInFlight.delete(providerId);
+    });
+    this.probingInFlight.set(providerId, job);
+    return job;
+  }
+
+  private async runProbeProvider(
     providerId: ProviderId,
     cwd?: string
   ): Promise<{ ok: boolean; status: ProviderStatusInfo; detail: string }> {
@@ -167,26 +340,76 @@ export class ProviderRegistry {
           const agyMeta = (sRes._meta as Record<string, unknown> | undefined)?.antigravity as
             | { tier?: { name?: string } }
             | undefined;
-          if (agyMeta?.tier?.name) {
-            this.recordObservedTier(providerId, agyMeta.tier.name);
-            detail = `已连接订阅 · ${agyMeta.tier.name}`;
+          const observedTier = agyMeta?.tier?.name;
+          if (observedTier) {
+            detail = `已连接订阅 · ${observedTier}`;
           } else {
-            this.verifiedLive.add(providerId);
             detail = `ACP 握手正常 (${initRes.agentInfo?.name || providerId})`;
           }
 
-          const modelOpt = (sRes.configOptions ?? []).find(
-            (o) => o.id === "model" || o.category === "model"
+          const initConfig = sRes.configOptions ?? [];
+          const modelOpt = initConfig.find(
+            (o) => o.type === "select" && (o.id === "model" || o.category === "model")
           );
+          const initThought = extractThoughtLevelsFromConfig(initConfig);
+          const discoveredModels: ProviderModelOption[] = [];
+
           if (modelOpt && modelOpt.type === "select") {
-            const models: ProviderModelOption[] = modelOpt.options.flatMap((item) =>
-              "options" in item
-                ? item.options.map((sub) => ({ value: sub.value, name: sub.name }))
-                : [{ value: item.value, name: item.name }]
-            );
-            if (models.length > 0) {
-              this.cachedModelsByProvider.set(providerId, models);
+            const rawList = extractSelectOptions(modelOpt);
+            for (const m of rawList) {
+              // Fast path: reuse initial configOptions if this model is already active
+              if (m.value === modelOpt.currentValue) {
+                discoveredModels.push({
+                  value: m.value,
+                  name: m.name,
+                  thoughtLevels: initThought.levels,
+                  defaultThoughtLevel: initThought.currentValue,
+                });
+                continue;
+              }
+              try {
+                const upd = await agent.request(acp.methods.agent.session.setConfigOption, {
+                  sessionId: sRes.sessionId,
+                  configId: modelOpt.id,
+                  value: m.value,
+                });
+                const tl = extractThoughtLevelsFromConfig(upd.configOptions);
+                discoveredModels.push({
+                  value: m.value,
+                  name: m.name,
+                  thoughtLevels: tl.levels,
+                  defaultThoughtLevel: tl.currentValue,
+                });
+              } catch {
+                discoveredModels.push({
+                  value: m.value,
+                  name: m.name,
+                  thoughtLevels: initThought.levels,
+                  defaultThoughtLevel: initThought.currentValue,
+                });
+              }
             }
+          }
+
+          const caps: PersistedProviderCapabilities = {
+            providerId,
+            tierName: observedTier || this.capsByProvider.get(providerId)?.tierName,
+            models: discoveredModels.length > 0 ? discoveredModels : spec.info.models,
+            defaultModel:
+              (modelOpt && modelOpt.type === "select" && modelOpt.currentValue) ||
+              discoveredModels[0]?.value ||
+              spec.info.defaultModel,
+            thoughtLevels:
+              initThought.levels.length > 0 ? initThought.levels : spec.info.thoughtLevels,
+            defaultThoughtLevel: initThought.currentValue || spec.info.defaultThoughtLevel,
+            probedAt: new Date().toISOString(),
+          };
+          this.capsByProvider.set(providerId, caps);
+          this.verifiedLive.add(providerId);
+          this.store?.saveProviderCapabilities(caps);
+
+          if (discoveredModels.length > 0) {
+            detail += `（已同步 ${discoveredModels.length} 个模型与思考强度）`;
           }
 
           if (initRes.agentCapabilities?.sessionCapabilities?.close) {
@@ -194,7 +417,7 @@ export class ProviderRegistry {
           }
         }),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("检测超时（10 秒内未完成握手）")), 10000)
+          setTimeout(() => reject(new Error("检测超时（18 秒内未完成握手）")), 18000)
         ),
       ]);
 
@@ -256,16 +479,60 @@ export class ProviderRegistry {
 
     // 1. Google Antigravity ACP (`agy acp`)
     const agyBin = bins.agy;
-    const agyTier = this.cachedTierByProvider.get("agy");
-    const agyModels = this.cachedModelsByProvider.get("agy") ?? [
-      { value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
-      { value: "gemini-4-argon", name: "Gemini 4 Argon" },
-      { value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
-      { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      { value: "gemini-pro-orchestrator", name: "Orchestrator (Carbon)" },
-      { value: "claude-opus-5-5", name: "Claude Opus 5.5 (Ultra)" },
-      { value: "claude-sonnet-5-5", name: "Claude Sonnet 5.5 (Ultra)" },
+    const agyCap = this.capsByProvider.get("agy");
+    const agyTier = agyCap?.tierName;
+    const defaultAgyLevels: ThoughtLevelOption[] = [
+      { value: "low", name: "低 (Low)" },
+      { value: "medium", name: "中 (Medium)" },
+      { value: "high", name: "高 (High)" },
+      { value: "xhigh", name: "极高 (Extra)" },
     ];
+    const agyModels: ProviderModelOption[] = agyCap?.models?.length
+      ? agyCap.models
+      : [
+          {
+            value: "gemini-4-neon",
+            name: "Gemini 4 Neon",
+            thoughtLevels: defaultAgyLevels,
+            defaultThoughtLevel: "high",
+          },
+          {
+            value: "gemini-4-carbon",
+            name: "Gemini 4 Carbon",
+            thoughtLevels: defaultAgyLevels.slice(0, 3),
+            defaultThoughtLevel: "high",
+          },
+          {
+            value: "gemini-4-argon",
+            name: "Gemini 4 Argon",
+            thoughtLevels: defaultAgyLevels.slice(0, 3),
+            defaultThoughtLevel: "high",
+          },
+          {
+            value: "gemini-4-hydrogen",
+            name: "Gemini 4 Hydrogen",
+            thoughtLevels: defaultAgyLevels,
+            defaultThoughtLevel: "high",
+          },
+          {
+            value: "gemini-3.8-flash",
+            name: "Gemini 3.8 Flash",
+            thoughtLevels: defaultAgyLevels.slice(0, 3),
+            defaultThoughtLevel: "medium",
+          },
+          {
+            value: "claude-opus-5-5",
+            name: "Claude Opus 5.5",
+            thoughtLevels: defaultAgyLevels.slice(0, 3),
+            defaultThoughtLevel: "medium",
+          },
+          {
+            value: "claude-sonnet-5-5",
+            name: "Claude Sonnet 5.5",
+            thoughtLevels: defaultAgyLevels.slice(0, 3),
+            defaultThoughtLevel: "medium",
+          },
+        ];
 
     const agySpec: ProviderLaunchSpec = {
       id: "agy",
@@ -287,13 +554,10 @@ export class ProviderRegistry {
           ? `已就绪${agyTier ? ` · ${agyTier}` : ""} (${path.basename(agyBin)})`
           : "未检测到 agy CLI（安装 Google.AntigravityCLI 后在终端执行 agy acp --login）",
         models: agyModels,
-        defaultModel: "gemini-4-carbon",
-        thoughtLevels: [
-          { value: "high", name: "高 (High)" },
-          { value: "medium", name: "中 (Medium)" },
-          { value: "low", name: "低 (Low)" },
-        ],
-        defaultThoughtLevel: "high",
+        defaultModel: agyCap?.defaultModel || agyModels[0]?.value || "gemini-4-neon",
+        thoughtLevels: agyCap?.thoughtLevels ?? defaultAgyLevels,
+        defaultThoughtLevel: agyCap?.defaultThoughtLevel || "high",
+        lastProbedAt: agyCap?.probedAt,
       },
     };
 
@@ -308,6 +572,12 @@ export class ProviderRegistry {
     );
     const claudeCliBin = bins.claude;
     const claudeBridgeExists = existsSync(claudeBridgeJs);
+    const claudeCap = this.capsByProvider.get("claude");
+    const claudeDefaultLevels: ThoughtLevelOption[] = [
+      { value: "low", name: "低 (Low)" },
+      { value: "medium", name: "中 (Medium)" },
+      { value: "high", name: "高 (High)" },
+    ];
 
     const claudeSpec: ProviderLaunchSpec = {
       id: "claude",
@@ -318,27 +588,28 @@ export class ProviderRegistry {
         id: "claude",
         name: "Anthropic Claude Code",
         shortName: "Claude Code",
-        subscriptionLabel: "Claude Pro / Max",
+        subscriptionLabel: claudeCap?.tierName || "Claude Pro / Max",
         adapterLabel: "@agentclientprotocol/claude-agent-acp",
         available: claudeBridgeExists && Boolean(claudeCliBin),
         verified: this.verifiedLive.has("claude"),
+        tierName: claudeCap?.tierName,
         binaryPath: claudeCliBin,
         loginCommand: "claude /login",
         statusMessage:
           claudeBridgeExists && claudeCliBin
             ? `已接入适配器 (${path.basename(claudeCliBin)} 已安装)`
             : "已内置适配器（需本地安装并在终端登录 claude CLI）",
-        models: this.cachedModelsByProvider.get("claude") ?? [
-          { value: "default", name: "Claude Default (Subscription)" },
-          { value: "claude-opus-4-5", name: "Claude Opus" },
-          { value: "claude-sonnet-4-5", name: "Claude Sonnet" },
-        ],
-        defaultModel: "default",
-        thoughtLevels: [
-          { value: "high", name: "高 (High)" },
-          { value: "medium", name: "中 (Medium)" },
-        ],
-        defaultThoughtLevel: "high",
+        models: claudeCap?.models?.length
+          ? claudeCap.models
+          : [
+              { value: "default", name: "Claude Default (Subscription)" },
+              { value: "claude-opus-4-5", name: "Claude Opus" },
+              { value: "claude-sonnet-4-5", name: "Claude Sonnet" },
+            ],
+        defaultModel: claudeCap?.defaultModel || "default",
+        thoughtLevels: claudeCap?.thoughtLevels ?? claudeDefaultLevels,
+        defaultThoughtLevel: claudeCap?.defaultThoughtLevel || "high",
+        lastProbedAt: claudeCap?.probedAt,
       },
     };
 
@@ -353,6 +624,13 @@ export class ProviderRegistry {
     );
     const codexCliBin = bins.codex;
     const codexBridgeExists = existsSync(codexBridgeJs);
+    const codexCap = this.capsByProvider.get("codex");
+    const codexDefaultLevels: ThoughtLevelOption[] = [
+      { value: "low", name: "低 (Low)" },
+      { value: "medium", name: "中 (Medium)" },
+      { value: "high", name: "高 (High)" },
+      { value: "xhigh", name: "极高 (Extra)" },
+    ];
 
     const codexSpec: ProviderLaunchSpec = {
       id: "codex",
@@ -363,25 +641,26 @@ export class ProviderRegistry {
         id: "codex",
         name: "OpenAI Codex",
         shortName: "Codex",
-        subscriptionLabel: "ChatGPT Plus / Pro",
+        subscriptionLabel: codexCap?.tierName || "ChatGPT Plus / Pro",
         adapterLabel: "@agentclientprotocol/codex-acp",
         available: codexBridgeExists && Boolean(codexCliBin),
         verified: this.verifiedLive.has("codex"),
+        tierName: codexCap?.tierName,
         binaryPath: codexCliBin || codexBridgeJs,
         loginCommand: "codex login",
         statusMessage: codexCliBin
           ? `已接入适配器 (${path.basename(codexCliBin)} 已安装)`
           : "已内置适配器（需本地安装并在终端执行 codex login）",
-        models: this.cachedModelsByProvider.get("codex") ?? [
-          { value: "default", name: "Codex Default (Subscription)" },
-          { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-        ],
-        defaultModel: "default",
-        thoughtLevels: [
-          { value: "high", name: "高 (High)" },
-          { value: "medium", name: "中 (Medium)" },
-        ],
-        defaultThoughtLevel: "high",
+        models: codexCap?.models?.length
+          ? codexCap.models
+          : [
+              { value: "default", name: "Codex Default (Subscription)" },
+              { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+            ],
+        defaultModel: codexCap?.defaultModel || "default",
+        thoughtLevels: codexCap?.thoughtLevels ?? codexDefaultLevels,
+        defaultThoughtLevel: codexCap?.defaultThoughtLevel || "high",
+        lastProbedAt: codexCap?.probedAt,
       },
     };
 

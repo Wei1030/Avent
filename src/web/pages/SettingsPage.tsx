@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import type {
-  CompatibleEndpointRecord,
   InstructionDoc,
   PermissionMode,
   PermissionRuleRecord,
@@ -413,10 +412,10 @@ function InstructionsSettings() {
 }
 
 function ProviderSettings() {
-  const { providers, setProviders, prefs, updatePrefs, toast, t } = useApp();
+  const { providers, setProviders, endpoints, setEndpoints, prefs, updatePrefs, toast, t } =
+    useApp();
   const [selectedId, setSelectedId] = useState<ProviderId>(prefs.defaultProviderId || "agy");
   const [checkingId, setCheckingId] = useState<ProviderId | null>(null);
-  const [endpoints, setEndpoints] = useState<CompatibleEndpointRecord[]>([]);
   const [epModalOpen, setEpModalOpen] = useState(false);
   const [epName, setEpName] = useState("");
   const [epUrl, setEpUrl] = useState("");
@@ -461,7 +460,7 @@ function ProviderSettings() {
         apiKey: epKey,
         models: models.length > 0 ? models : ["default"],
       });
-      setEndpoints((prev) => [res.endpoint, ...prev]);
+      setEndpoints([res.endpoint, ...endpoints]);
       setEpModalOpen(false);
       setEpName("");
       setEpUrl("");
@@ -559,13 +558,29 @@ function ProviderSettings() {
             </dl>
 
             <div>
-              <div className="section-title">支持切换的模型</div>
+              <div className="section-title">
+                支持切换的模型（共 {selected.models.length} 个
+                {selected.lastProbedAt ? " · 已实时同步思考强度" : " · 点击重新检测可动态同步"}）
+              </div>
               <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-                {selected.models.map((m) => (
-                  <Chip key={m.value} outline mono>
-                    {m.name} ({m.value})
-                  </Chip>
-                ))}
+                {selected.models.map((m) => {
+                  const tlLabel =
+                    m.thoughtLevels === undefined
+                      ? ""
+                      : m.thoughtLevels.length === 0
+                        ? " · 无独立思考档位"
+                        : ` · ${m.thoughtLevels.map((l) => l.value).join("/")}`;
+                  return (
+                    <Chip key={m.value} outline mono title={`${m.value}${tlLabel}`}>
+                      {m.name}
+                      {tlLabel && (
+                        <span className="muted" style={{ fontWeight: 400 }}>
+                          {tlLabel}
+                        </span>
+                      )}
+                    </Chip>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -618,7 +633,7 @@ function ProviderSettings() {
                     icon="trash"
                     onClick={async () => {
                       await api.deleteEndpoint(ep.id);
-                      setEndpoints((prev) => prev.filter((x) => x.id !== ep.id));
+                      setEndpoints(endpoints.filter((x) => x.id !== ep.id));
                     }}
                   />
                 </div>

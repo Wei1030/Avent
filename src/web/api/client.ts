@@ -12,6 +12,7 @@ import type {
   ProviderStatusInfo,
   SkillRecord,
   TaskDetailResponse,
+  TaskProviderId,
   TaskRecord,
   TaskRef,
   UsageReport,
@@ -40,6 +41,7 @@ export const api = {
       tasks: TaskRecord[];
       approvals: ApprovalRequest[];
       providers: ProviderStatusInfo[];
+      endpoints: CompatibleEndpointRecord[];
       prefs: AppPreferences;
       defaultCwd: string;
     }>("/api/bootstrap"),
@@ -108,9 +110,10 @@ export const api = {
     id: string,
     patch: {
       title?: string;
+      originalObjective?: string;
       tags?: string[];
       permissionMode?: PermissionMode;
-      providerId?: ProviderId;
+      providerId?: TaskProviderId;
       modelId?: string;
       thoughtLevel?: string;
     }

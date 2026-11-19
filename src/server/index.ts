@@ -16,6 +16,7 @@ import type {
   PermissionMode,
   ProviderId,
   PulseMode,
+  TaskProviderId,
   TaskRef,
 } from "../shared/types.js";
 
@@ -41,19 +42,39 @@ export function createAventApp(options?: {
   dataDir?: string;
   port?: number;
   projectRoot?: string;
+  skipBackgroundProbe?: boolean;
 }) {
   const root = options?.projectRoot ?? projectRoot;
   const dataDir = options?.dataDir ?? path.join(root, ".avent");
   const port = options?.port ?? Number(process.env.AVENT_PORT || 4320);
 
   const store = new AventStore(dataDir, root);
-  const registry = new ProviderRegistry(root);
+  const registry = new ProviderRegistry(root, store);
   const engine = new PulseEngine({
     store,
     registry,
     projectRoot: root,
     aventApiUrl: `http://127.0.0.1:${port}`,
   });
+
+  // Non-blocking background capability probe on fresh installs (discovers live models + per-model thought levels)
+  if (!options?.skipBackgroundProbe) {
+    setTimeout(() => {
+      const statuses = registry.listProviderStatuses();
+      for (const p of statuses) {
+        if (p.available && !registry.hasPersistedCapabilities(p.id)) {
+          void registry.probeProvider(p.id, root).then((res) => {
+            if (res.ok) {
+              engine.broadcast({
+                type: "providers_updated",
+                providers: registry.listProviderStatuses(),
+              });
+            }
+          });
+        }
+      }
+    }, 800);
+  }
 
   const app = new Hono();
 
@@ -75,6 +96,7 @@ export function createAventApp(options?: {
       tasks,
       approvals: engine.listPendingApprovals(),
       providers: registry.listProviderStatuses(),
+      endpoints: store.listCompatibleEndpoints(),
       prefs: store.getPreferences(),
       defaultCwd: root,
     });
@@ -222,9 +244,11 @@ export function createAventApp(options?: {
   app.post("/api/providers/:id/check", async (c) => {
     const providerId = c.req.param("id") as ProviderId;
     const result = await registry.probeProvider(providerId, root);
+    const providers = registry.listProviderStatuses();
+    engine.broadcast({ type: "providers_updated", providers });
     return c.json({
       ...result,
-      providers: registry.listProviderStatuses(),
+      providers,
     });
   });
 
@@ -267,19 +291,26 @@ export function createAventApp(options?: {
 
     const objectiveText = (body.objective ?? "").trim();
     const isDraft = Boolean(body.draft) || objectiveText.length === 0;
+    const chosenModelId = body.modelId || spec.info.defaultModel;
+    const chosenModelMeta = spec.info.models.find((m) => m.value === chosenModelId);
+    const chosenThoughtLevel =
+      body.thoughtLevel ??
+      (chosenModelMeta?.thoughtLevels?.length === 0
+        ? ""
+        : chosenModelMeta?.defaultThoughtLevel || spec.info.defaultThoughtLevel);
 
     const task = store.createTask({
       workspaceId: body.workspaceId,
       title: body.title,
-      objective: isDraft ? "" : objectiveText,
+      objective: "",
       completionCriteria: body.completionCriteria,
       cwd,
       providerId,
-      modelId: body.modelId || spec.info.defaultModel,
-      thoughtLevel: body.thoughtLevel || spec.info.defaultThoughtLevel,
+      modelId: chosenModelId,
+      thoughtLevel: chosenThoughtLevel,
       permissionMode: body.permissionMode || prefs.defaultPermissionMode,
       pulseMode: body.pulseMode || "micro-stretch",
-      draft: isDraft,
+      draft: true,
     });
 
     if (!isDraft && objectiveText) {
@@ -318,9 +349,10 @@ export function createAventApp(options?: {
 
     const body = await c.req.json<{
       title?: string;
+      originalObjective?: string;
       tags?: string[];
       permissionMode?: PermissionMode;
-      providerId?: ProviderId;
+      providerId?: TaskProviderId;
       modelId?: string;
       thoughtLevel?: string;
       pulseMode?: PulseMode;
@@ -328,10 +360,31 @@ export function createAventApp(options?: {
 
     let nextModel = body.modelId;
     let nextThought = body.thoughtLevel;
-    if (body.providerId && body.providerId !== task.providerId && !nextModel) {
-      const spec = registry.getLaunchSpec(body.providerId);
-      nextModel = spec.info.defaultModel;
-      nextThought = nextThought || spec.info.defaultThoughtLevel;
+    const targetProvider = body.providerId ?? task.providerId;
+
+    if (!targetProvider.startsWith("endpoint:")) {
+      const spec = registry.getLaunchSpec(targetProvider as ProviderId);
+      if (body.providerId && body.providerId !== task.providerId && !nextModel) {
+        nextModel = spec.info.defaultModel;
+      }
+      const effectiveModelId = nextModel ?? task.modelId;
+      const modelMeta = spec.info.models.find((m) => m.value === effectiveModelId);
+      const allowedLevels =
+        modelMeta?.thoughtLevels !== undefined
+          ? modelMeta.thoughtLevels
+          : spec.info.thoughtLevels;
+
+      if (allowedLevels.length === 0) {
+        nextThought = "";
+      } else {
+        const candidateThought = nextThought ?? task.thoughtLevel;
+        if (!allowedLevels.some((lv) => lv.value === candidateThought)) {
+          nextThought =
+            modelMeta?.defaultThoughtLevel ||
+            spec.info.defaultThoughtLevel ||
+            allowedLevels[0].value;
+        }
+      }
     }
 
     const updated = store.updateTaskMeta(taskId, {
@@ -695,6 +748,9 @@ export function createAventApp(options?: {
     try {
       const res = engine.commitStateFromMcp(pulseId, {
         status: body.status,
+        taskTitle: typeof body.taskTitle === "string" ? body.taskTitle : undefined,
+        taskObjective: typeof body.taskObjective === "string" ? body.taskObjective : undefined,
+        newDirectives: Array.isArray(body.newDirectives) ? body.newDirectives : undefined,
         deliverableSummary: body.deliverableSummary,
         establishedFacts: body.establishedFacts ?? [],
         openHypotheses: body.openHypotheses ?? [],

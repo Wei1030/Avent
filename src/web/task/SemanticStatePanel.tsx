@@ -25,11 +25,18 @@ export function SemanticStatePanel({
   const [selectedVer, setSelectedVer] = useState<number | "latest">("latest");
   const [directiveDraft, setDirectiveDraft] = useState("");
   const [addingRule, setAddingRule] = useState(false);
+  const [editingObjective, setEditingObjective] = useState(false);
+  const [objectiveDraft, setObjectiveDraft] = useState("");
+  const [savingObjective, setSavingObjective] = useState(false);
 
   // Reset to latest whenever a new state version arrives
   useEffect(() => {
     setSelectedVer("latest");
   }, [task.id, states.length]);
+
+  useEffect(() => {
+    setEditingObjective(false);
+  }, [task.id]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -72,6 +79,19 @@ export function SemanticStatePanel({
       await api.removeDirective(task.id, directiveId);
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const handleSaveObjective = async () => {
+    setSavingObjective(true);
+    try {
+      await api.updateTask(task.id, { originalObjective: objectiveDraft.trim() });
+      setEditingObjective(false);
+      toast(objectiveDraft.trim() ? "已更新任务目标" : "已重置任务目标为待明确", "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setSavingObjective(false);
     }
   };
 
@@ -133,24 +153,75 @@ export function SemanticStatePanel({
             <div className="sstate-card-title">
               <Icon name="pin" size={13} className="accent" />
               <span>{t("任务目标与持久约定")}</span>
+              {!task.originalObjective && <Status tone="warn">待明确</Status>}
               {task.steeringDirectives.length > 0 && (
                 <span className="count">{task.steeringDirectives.length} 条约定</span>
               )}
+              {!editingObjective && (
+                <button
+                  type="button"
+                  className="btn ghost sm icon-only"
+                  style={{ width: 22, height: 22, marginLeft: task.steeringDirectives.length > 0 ? 4 : "auto" }}
+                  title="手动编辑任务目标"
+                  onClick={() => {
+                    setObjectiveDraft(task.originalObjective);
+                    setEditingObjective(true);
+                  }}
+                >
+                  <Icon name="pencil" size={12} />
+                </button>
+              )}
             </div>
 
-            {task.originalObjective ? (
+            {editingObjective ? (
+              <div className="col" style={{ gap: 6 }}>
+                <textarea
+                  autoFocus
+                  className="textarea"
+                  style={{ minHeight: 68, fontSize: 12.5 }}
+                  placeholder="输入明确的任务目标（留空保存将恢复为待明确状态）…"
+                  value={objectiveDraft}
+                  onChange={(e) => setObjectiveDraft(e.target.value)}
+                />
+                <div className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
+                  <Button size="sm" onClick={() => setEditingObjective(false)}>
+                    {t("取消")}
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    busy={savingObjective}
+                    onClick={() => void handleSaveObjective()}
+                  >
+                    {t("保存")}
+                  </Button>
+                </div>
+              </div>
+            ) : task.originalObjective ? (
               <div className="sstate-objective">{task.originalObjective}</div>
             ) : (
               <div className="muted" style={{ fontSize: 12 }}>
-                发送第一条消息后，这里将锁定本任务的核心目标与持久约束。
+                尚未明确具体目标。在左侧说明你的需求后，智能体会自动归纳并更新目标；也可以随时点击右上角铅笔手动设定。
               </div>
             )}
 
             {task.steeringDirectives.length > 0 && (
               <div className="col" style={{ gap: 5 }}>
                 {task.steeringDirectives.map((d) => (
-                  <div key={d.id} className="sstate-directive">
-                    <Icon name="shield" size={13} />
+                  <div
+                    key={d.id}
+                    className={cx("sstate-directive", d.source === "model" && "model")}
+                    title={
+                      d.source === "model"
+                        ? "由智能体从对话中自动识别为长期约定（点击右侧 × 可随时删除）"
+                        : "你手动添加的持久约定"
+                    }
+                  >
+                    <Icon
+                      name={d.source === "model" ? "spark" : "shield"}
+                      size={13}
+                      className={d.source === "model" ? "accent" : undefined}
+                    />
                     <span className="grow">{d.directive}</span>
                     <button
                       type="button"

@@ -21,23 +21,41 @@ async function postInternal<T>(endpoint: string, body: unknown): Promise<T> {
 
 const mcp = new McpServer({
   name: "avent",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 mcp.tool(
   "avent_commit_state",
-  "Commit the structured SSSM Semantic State handoff brief to the Avent sessionless kernel. Call this tool as soon as you finish answering/solving the current objective (status='COMPLETED'), need human input/clarification (status='WAITING_HUMAN'), or reach the pulse step/token budget with more work remaining (status='CONTINUE').",
+  "Commit the structured Task State brief to Avent. Call this tool as soon as you finish answering/solving the current request (status='COMPLETED'), need human input/follow-up (status='WAITING_HUMAN'), or need another bounded round (status='CONTINUE'). You may also set/refine taskTitle, taskObjective (leave empty if user only greeted without a concrete goal), and newDirectives for any durable rules the user specified.",
   {
     status: z
       .enum(["CONTINUE", "WAITING_HUMAN", "COMPLETED", "FAILED"])
       .describe(
-        "COMPLETED if the user's request/objective is satisfied; WAITING_HUMAN if you answered a conversational question and await follow-up OR need human clarification/decision; CONTINUE if autonomous steps remain for the next fresh pulse."
+        "COMPLETED if the user's request/objective is satisfied; WAITING_HUMAN if you answered a greeting/question and await follow-up OR need human clarification; CONTINUE if autonomous steps remain for the next round."
+      ),
+    taskTitle: z
+      .string()
+      .optional()
+      .describe(
+        "Concise 6-24 char human-readable title for this task in the user's language (e.g. '排查登录接口 500 错误'). Omit if title is already accurate or if user only said hello."
+      ),
+    taskObjective: z
+      .string()
+      .optional()
+      .describe(
+        "Clear, distilled task objective once the user states a concrete request/goal. IMPORTANT: Leave omitted/empty if the user only sent a greeting (e.g. '你好', 'hi') or has not yet stated a concrete task objective!"
+      ),
+    newDirectives: z
+      .array(z.string())
+      .default([])
+      .describe(
+        "Any NEW durable constraints, preferences, or standing rules expressed by the user in this turn that must apply across future rounds (e.g. '始终使用 npm.cmd', '不要修改迁移文件', '回复尽量简洁'). Omit temporary one-off instructions and avoid duplicating existing persistent directives."
       ),
     deliverableSummary: z
       .string()
       .min(1)
       .describe(
-        "Clear, direct response or progress report shown directly to the user in the Avent UI (use Markdown; write in the user's language)."
+        "Clear, natural response or progress report shown directly to the user in the Avent UI (use Markdown; write in the user's language)."
       ),
     establishedFacts: z
       .array(
@@ -79,7 +97,7 @@ mcp.tool(
         })
       )
       .default([])
-      .describe("Failed approaches that future pulses MUST NOT repeat."),
+      .describe("Failed approaches that future rounds MUST NOT repeat."),
     remainingPlan: z
       .array(z.string())
       .default([])
@@ -87,7 +105,7 @@ mcp.tool(
     immediateNextAction: z
       .string()
       .default("")
-      .describe("Exact next command or edit for the next pulse if status='CONTINUE', or empty if done."),
+      .describe("Exact next command or edit for the next round if status='CONTINUE', or empty if done."),
     humanQuestion: z
       .string()
       .optional()
@@ -148,9 +166,9 @@ mcp.tool(
 
 mcp.tool(
   "avent_history_grep",
-  "Search lossless raw transcripts of prior destroyed pulses for this task if you ever need an exact detail omitted from the Semantic State.",
+  "Search lossless raw transcripts of prior rounds for this task if you ever need an exact detail omitted from Task State.",
   {
-    query: z.string().describe("Keyword or regex to search across archived pulses."),
+    query: z.string().describe("Keyword or regex to search across archived rounds."),
     maxMatches: z.number().int().min(1).max(50).optional(),
   },
   async (args) => {

@@ -13,6 +13,7 @@ export function TasksListPage() {
     setActiveWorkspaceId,
     setFolderPickerOpen,
     tasks,
+    confirm,
     toast,
     lang,
     t,
@@ -64,6 +65,25 @@ export function TasksListPage() {
     if (!trimmed) return;
     try {
       await api.updateTask(id, { title: trimmed });
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const handleDeleteTask = async (taskId: string, title: string, isRunning: boolean) => {
+    const ok = await confirm({
+      title: "删除任务",
+      message: `确定要永久删除任务「${title}」吗？`,
+      detail: isRunning
+        ? "该任务正在运行，确认后将先中止执行，并永久删除其对话记录与状态记忆，此操作无法撤销。"
+        : "将永久删除该任务的全部对话记录与状态记忆，此操作无法撤销。",
+      confirmLabel: "确认删除",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.deleteTask(taskId);
+      toast(`已删除任务：${title}`, "good");
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     }
@@ -195,7 +215,13 @@ export function TasksListPage() {
                       size="sm"
                       icon="trash"
                       title={t("删除")}
-                      onClick={() => void api.deleteTask(tk.id)}
+                      onClick={() =>
+                        void handleDeleteTask(
+                          tk.id,
+                          tk.title,
+                          tk.status === "PULSING" || tk.status === "WAITING_APPROVAL"
+                        )
+                      }
                     />
                   </div>
                 </div>

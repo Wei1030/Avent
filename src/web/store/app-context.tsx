@@ -53,6 +53,15 @@ export interface NewTaskConfig {
   permissionMode?: PermissionMode;
 }
 
+export interface ConfirmOptions {
+  title: string;
+  message: string;
+  detail?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
+}
+
 const EMPTY_DRAFT: ComposerDraft = {
   text: "",
   attachments: [],
@@ -123,6 +132,10 @@ interface AppContextValue {
   lastTaskViewByWs: Record<string, string>;
   recordTaskView: (workspaceId: string, view: string) => void;
   resolveWorkspaceTaskRoute: (workspaceId?: string, overrideTasks?: TaskRecord[]) => string;
+  // In-app confirmation modal
+  confirmState: ConfirmOptions | null;
+  confirm: (options: ConfirmOptions) => Promise<boolean>;
+  resolveConfirm: (accepted: boolean) => void;
 }
 
 const DEFAULT_PREFS: AppPreferences = {
@@ -151,9 +164,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [filePreview, setFilePreview] = useState<FilePreviewTarget | null>(null);
+  const [confirmState, setConfirmState] = useState<ConfirmOptions | null>(null);
+  const confirmResolverRef = useRef<((ok: boolean) => void) | null>(null);
   const [statePanelOpen, setStatePanelOpenState] = useState<boolean>(
     () => localStorage.getItem("avent.statePanelOpen") !== "false"
   );
+
+  const confirm = useCallback((options: ConfirmOptions): Promise<boolean> => {
+    // If an earlier dialog was somehow pending, resolve it as cancelled first
+    if (confirmResolverRef.current) {
+      confirmResolverRef.current(false);
+      confirmResolverRef.current = null;
+    }
+    setConfirmState(options);
+    return new Promise<boolean>((resolve) => {
+      confirmResolverRef.current = resolve;
+    });
+  }, []);
+
+  const resolveConfirm = useCallback((accepted: boolean) => {
+    const fn = confirmResolverRef.current;
+    confirmResolverRef.current = null;
+    setConfirmState(null);
+    fn?.(accepted);
+  }, []);
 
   // Ref-backed composer drafts (zero app-wide re-renders while typing, always synchronously persisted)
   const draftsRef = useRef<Record<string, ComposerDraft>>(
@@ -535,6 +569,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       lastTaskViewByWs,
       recordTaskView,
       resolveWorkspaceTaskRoute,
+      confirmState,
+      confirm,
+      resolveConfirm,
     }),
     [
       ready,
@@ -570,6 +607,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       lastTaskViewByWs,
       recordTaskView,
       resolveWorkspaceTaskRoute,
+      confirmState,
+      confirm,
+      resolveConfirm,
     ]
   );
 

@@ -611,6 +611,9 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       const reAttached = store.getTask(realTask.id)!;
       assert.equal(reAttached.workspaceId, reAdded.id);
       assert.equal(reAdded.taskCount, 1);
+
+      // No built-in skills by default
+      assert.deepEqual(store.listSkills(reAdded.id), []);
     } finally {
       store.close();
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

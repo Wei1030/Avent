@@ -328,7 +328,7 @@ export function Composer({
               <Icon name="spark" size={14} />
               <span className="grow">
                 调用技能模板
-                <span className="desc">输入 / 选择验证、改动总结或自定义技能</span>
+                <span className="desc">输入 / 选择工作区或全局自定义技能</span>
               </span>
             </button>
           </Popover>

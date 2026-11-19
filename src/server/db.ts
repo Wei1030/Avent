@@ -51,44 +51,6 @@ const DEFAULT_PREFS: AppPreferences = {
   desktopNotifications: true,
 };
 
-const BUILTIN_SKILLS: SkillRecord[] = [
-  {
-    id: "builtin:verify",
-    name: "verify",
-    description: "运行类型检查、构建与测试，验证当前任务的代码改动是否可靠",
-    scope: "builtin",
-    argumentHint: "[可选测试范围]",
-    editable: false,
-    updatedAt: "2026-11-18T00:00:00.000Z",
-    content: `请对当前工作区中的近期修改执行完整的工程验证：
-1. 检查项目配置（如 package.json / tsconfig.json）以确定正确的类型检查与测试命令。
-2. 运行类型检查与相关单元测试。
-3. 若发现错误，直接定位原因并修复；验证通过后，将精确命令与结果写入状态记忆的验证记录中。`,
-  },
-  {
-    id: "builtin:changes-summary",
-    name: "changes-summary",
-    description: "梳理当前工作区未提交的 Git 变更，生成结构化改动说明",
-    scope: "builtin",
-    editable: false,
-    updatedAt: "2026-11-18T00:00:00.000Z",
-    content: `请检查当前工作区的 Git 状态与未提交差异（git status / git diff --stat），按模块归纳核心改动点、潜在影响面以及建议的验证步骤。`,
-  },
-  {
-    id: "builtin:investigate",
-    name: "investigate",
-    description: "针对问题或模块进行精确定位分析，将关键结论带行号沉淀到状态记忆",
-    scope: "builtin",
-    argumentHint: "<问题描述或模块名>",
-    editable: false,
-    updatedAt: "2026-11-18T00:00:00.000Z",
-    content: `请使用按需检索与分段读取方式深入排查目标问题：
-1. 先用正则检索定位相关符号与调用链，避免整文件盲读。
-2. 区分已验证的事实（附带精确 file#line）与尚待验证的假设。
-3. 给出清晰的根因结论与下一步可执行建议。`,
-  },
-];
-
 export class AventStore {
   public readonly dataDir: string;
   public readonly spillsDir: string;
@@ -1441,7 +1403,7 @@ export class AventStore {
   // =========================================================================
 
   public listSkills(workspaceId?: string): SkillRecord[] {
-    const out: SkillRecord[] = [...BUILTIN_SKILLS];
+    const out: SkillRecord[] = [];
 
     const loadDir = (
       dir: string,

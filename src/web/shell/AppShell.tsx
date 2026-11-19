@@ -6,6 +6,7 @@ import { Button, Chip, Popover, Select } from "../components/ui.js";
 import { cx, relTime, taskStatusDisplay } from "../lib/format.js";
 import { FolderPickerModal } from "./FolderPickerModal.js";
 import { FilePreviewModal } from "./FilePreviewModal.js";
+import { ConfirmModal } from "./ConfirmModal.js";
 
 export function AppShell() {
   const {
@@ -370,6 +371,7 @@ export function AppShell() {
       {/* Global Modals & Toasts */}
       <FolderPickerModal />
       <FilePreviewModal />
+      <ConfirmModal />
 
       {toasts.length > 0 && (
         <div className="toasts">

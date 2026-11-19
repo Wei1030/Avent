@@ -31,6 +31,7 @@ export function TaskPage() {
     getNewTaskConfig,
     updateNewTaskConfig,
     recordTaskView,
+    confirm,
     toast,
     lang,
     t,
@@ -215,11 +216,23 @@ export function TaskPage() {
     }
   };
 
-  const handleDeleteTask = async (targetId: string) => {
+  const handleDeleteTask = async (target: TaskRecord) => {
+    const isRunning = target.status === "PULSING" || target.status === "WAITING_APPROVAL";
+    const ok = await confirm({
+      title: "删除任务",
+      message: `确定要永久删除任务「${target.title}」吗？`,
+      detail: isRunning
+        ? "该任务正在运行，确认后将先中止执行，并永久删除其对话记录与状态记忆，此操作无法撤销。"
+        : "将永久删除该任务的全部对话记录与状态记忆，此操作无法撤销。",
+      confirmLabel: "确认删除",
+      danger: true,
+    });
+    if (!ok) return;
     try {
-      await api.deleteTask(targetId);
-      if (targetId === id) {
-        const next = wsTasks.find((x) => x.id !== targetId);
+      await api.deleteTask(target.id);
+      toast(`已删除任务：${target.title}`, "good");
+      if (target.id === id) {
+        const next = wsTasks.find((x) => x.id !== target.id);
         nav(next ? `/t/${next.id}` : "/t/new", { replace: true });
       }
     } catch (err) {
@@ -312,7 +325,7 @@ export function TaskPage() {
                     size="sm"
                     icon="trash"
                     title={t("删除")}
-                    onClick={() => void handleDeleteTask(tk.id)}
+                    onClick={() => void handleDeleteTask(tk)}
                   />
                 </div>
               </div>

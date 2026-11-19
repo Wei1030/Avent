@@ -8,7 +8,7 @@ import { Button, Chip, Modal, Seg } from "../components/ui.js";
 import { cx } from "../lib/format.js";
 
 export function SkillsPage() {
-  const { activeWorkspace, toast, t } = useApp();
+  const { activeWorkspace, confirm, toast, t } = useApp();
   const nav = useNavigate();
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
@@ -27,10 +27,12 @@ export function SkillsPage() {
     const res = await api.listSkills(activeWorkspace?.id);
     setSkills(res.skills);
     setSelectedId((cur) => {
-      const target =
-        res.skills.find((s) => s.id === cur) ?? res.skills[0];
+      const target = res.skills.find((s) => s.id === cur) ?? res.skills[0];
       if (target) {
         setEditorText(target.content);
+        setDirty(false);
+      } else {
+        setEditorText("");
         setDirty(false);
       }
       return target?.id ?? "";
@@ -98,6 +100,14 @@ export function SkillsPage() {
   };
 
   const handleDelete = async (s: SkillRecord) => {
+    const ok = await confirm({
+      title: "删除技能",
+      message: `确定要删除自定义技能「/${s.name}」吗？`,
+      detail: s.filePath ? `将删除对应的本地 Markdown 文件：${s.filePath}` : "此操作无法撤销。",
+      confirmLabel: "确认删除",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await api.deleteSkill(s.id);
       await load();
@@ -120,6 +130,14 @@ export function SkillsPage() {
     }
   };
 
+  const openCreateModal = () => {
+    setNewScope(activeWorkspace ? "workspace" : "global");
+    setCreateOpen(true);
+  };
+
+  const wsSkills = skills.filter((s) => s.scope === "workspace");
+  const globalSkills = skills.filter((s) => s.scope === "global");
+
   return (
     <div className="page">
       <div className="page-inner">
@@ -127,126 +145,138 @@ export function SkillsPage() {
           <h1>技能与快捷指令</h1>
           <Chip>{skills.length}</Chip>
           <div className="grow" />
-          <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
+          <Button variant="primary" icon="plus" onClick={openCreateModal}>
             新建技能
           </Button>
         </div>
         <p className="page-sub">
-          将常用的工程检查流、代码规范或排查步骤封装为 Markdown 技能模板，在任意任务输入框输入{" "}
+          将你自己的常用流程、代码规范或排查步骤封装为 Markdown 技能模板，在任意任务输入框输入{" "}
           <code className="mono">/技能名</code> 即可一键调用。
         </p>
 
-        <div className="ext-layout">
-          {/* Left Skill List */}
-          <div className="ext-list">
-            <h5>内置技能</h5>
-            {skills
-              .filter((s) => s.scope === "builtin")
-              .map((s) => (
-                <div
-                  key={s.id}
-                  className={cx("ext-item", s.id === selected?.id && "on")}
-                  onClick={() => handleSelect(s)}
-                >
-                  <div className="top">
-                    <Icon name="spark" size={14} className="accent" />
-                    <b className="mono">/{s.name}</b>
-                  </div>
-                  <div className="sub truncate">{s.description}</div>
-                </div>
-              ))}
-
-            <h5>自定义技能</h5>
-            {skills.filter((s) => s.scope !== "builtin").length === 0 ? (
-              <div className="empty" style={{ padding: "18px 10px" }}>
-                暂无自定义技能，点击右上角「新建技能」创建
+        {skills.length === 0 ? (
+          <div className="panel">
+            <div className="empty" style={{ padding: "48px 20px" }}>
+              <b>还没有自定义技能</b>
+              <div>
+                你可以创建工作区专属（<code className="mono">.avent/skills</code> 或{" "}
+                <code className="mono">.claude/commands</code>）或全局通用的{" "}
+                <code className="mono">/</code> 快捷指令模板。
               </div>
-            ) : (
-              skills
-                .filter((s) => s.scope !== "builtin")
-                .map((s) => (
-                  <div
-                    key={s.id}
-                    className={cx("ext-item", s.id === selected?.id && "on")}
-                    onClick={() => handleSelect(s)}
-                  >
-                    <div className="top">
-                      <Icon name="spark" size={14} className="ink2" />
-                      <b className="mono">/{s.name}</b>
-                      <span className="grow" />
-                      <Chip>{s.scope === "global" ? "全局" : "工作区"}</Chip>
-                    </div>
-                    <div className="sub truncate">{s.description}</div>
-                  </div>
-                ))
-            )}
-          </div>
-
-          {/* Right Skill Detail & Editor */}
-          {selected && (
-            <div className="ext-detail">
-              <div className="panel">
-                <div className="panel-head">
-                  <Icon name="spark" size={17} className="accent" />
-                  <h3 className="mono">/{selected.name}</h3>
-                  <Chip>
-                    {selected.scope === "builtin"
-                      ? "内置只读"
-                      : selected.scope === "global"
-                        ? "全局技能"
-                        : "当前工作区"}
-                  </Chip>
-                  <div className="actions">
-                    <Button
-                      size="sm"
-                      icon="play"
-                      onClick={() => void handleRunInNewTask(selected)}
-                    >
-                      发起新任务执行
-                    </Button>
-                    {selected.editable && (
-                      <>
-                        <Button
-                          variant="primary"
-                          size="sm"
-                          busy={saving}
-                          disabled={!dirty}
-                          onClick={() => void handleSaveExisting()}
-                        >
-                          {t("保存")}
-                        </Button>
-                        <Button
-                          variant="danger-outline"
-                          size="sm"
-                          icon="trash"
-                          onClick={() => void handleDelete(selected)}
-                        >
-                          {t("删除")}
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                <div className="panel-body col" style={{ gap: 10 }}>
-                  <div className="ink2">{selected.description}</div>
-                  {selected.filePath && (
-                    <div className="hint mono">文件路径：{selected.filePath}</div>
-                  )}
-                  <textarea
-                    className="editor"
-                    readOnly={!selected.editable}
-                    value={editorText}
-                    onChange={(e) => {
-                      setEditorText(e.target.value);
-                      setDirty(true);
-                    }}
-                  />
-                </div>
+              <div style={{ marginTop: 14 }}>
+                <Button variant="primary" icon="plus" onClick={openCreateModal}>
+                  新建第一个技能
+                </Button>
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div className="ext-layout">
+            {/* Left Skill List */}
+            <div className="ext-list">
+              {wsSkills.length > 0 && (
+                <>
+                  <h5>当前工作区技能</h5>
+                  {wsSkills.map((s) => (
+                    <div
+                      key={s.id}
+                      className={cx("ext-item", s.id === selected?.id && "on")}
+                      onClick={() => handleSelect(s)}
+                    >
+                      <div className="top">
+                        <Icon name="spark" size={14} className="accent" />
+                        <b className="mono">/{s.name}</b>
+                        <span className="grow" />
+                        <Chip>工作区</Chip>
+                      </div>
+                      <div className="sub truncate">{s.description}</div>
+                    </div>
+                  ))}
+                </>
+              )}
+
+              {globalSkills.length > 0 && (
+                <>
+                  <h5>全局技能</h5>
+                  {globalSkills.map((s) => (
+                    <div
+                      key={s.id}
+                      className={cx("ext-item", s.id === selected?.id && "on")}
+                      onClick={() => handleSelect(s)}
+                    >
+                      <div className="top">
+                        <Icon name="spark" size={14} className="ink2" />
+                        <b className="mono">/{s.name}</b>
+                        <span className="grow" />
+                        <Chip>全局</Chip>
+                      </div>
+                      <div className="sub truncate">{s.description}</div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+
+            {/* Right Skill Detail & Editor */}
+            {selected && (
+              <div className="ext-detail">
+                <div className="panel">
+                  <div className="panel-head">
+                    <Icon name="spark" size={17} className="accent" />
+                    <h3 className="mono">/{selected.name}</h3>
+                    <Chip>{selected.scope === "global" ? "全局技能" : "当前工作区"}</Chip>
+                    <div className="actions">
+                      <Button
+                        size="sm"
+                        icon="play"
+                        onClick={() => void handleRunInNewTask(selected)}
+                      >
+                        发起新任务执行
+                      </Button>
+                      {selected.editable && (
+                        <>
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            busy={saving}
+                            disabled={!dirty}
+                            onClick={() => void handleSaveExisting()}
+                          >
+                            {t("保存")}
+                          </Button>
+                          <Button
+                            variant="danger-outline"
+                            size="sm"
+                            icon="trash"
+                            onClick={() => void handleDelete(selected)}
+                          >
+                            {t("删除")}
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="panel-body col" style={{ gap: 10 }}>
+                    <div className="ink2">{selected.description}</div>
+                    {selected.filePath && (
+                      <div className="hint mono">文件路径：{selected.filePath}</div>
+                    )}
+                    <textarea
+                      className="editor"
+                      readOnly={!selected.editable}
+                      value={editorText}
+                      onChange={(e) => {
+                        setEditorText(e.target.value);
+                        setDirty(true);
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Create Skill Modal */}
@@ -284,7 +314,7 @@ export function SkillsPage() {
             <Seg
               value={newScope}
               options={[
-                { value: "workspace", label: "当前工作区 (.avent/skills)" },
+                { value: "workspace", label: "当前工作区 (.avent/skills)", disabled: !activeWorkspace },
                 { value: "global", label: "全局通用" },
               ]}
               onChange={setNewScope}

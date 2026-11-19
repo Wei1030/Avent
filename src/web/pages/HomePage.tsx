@@ -15,6 +15,7 @@ export function HomePage() {
     tasks,
     setFolderPickerOpen,
     resolveWorkspaceTaskRoute,
+    confirm,
     toast,
     lang,
     t,
@@ -22,10 +23,38 @@ export function HomePage() {
   const nav = useNavigate();
 
   const handleRemoveWs = async (wsId: string, name: string) => {
+    const ok = await confirm({
+      title: "移除工作区",
+      message: `确定要从 Avent 列表中移除工作区「${name}」吗？`,
+      detail:
+        "此操作仅从列表移除，不会移动或删除本地磁盘上的任何文件；之后重新添加该文件夹即可自动恢复历史任务。",
+      confirmLabel: "确认移除",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const res = await api.deleteWorkspace(wsId);
       setWorkspaces(res.workspaces);
       toast(`已移除工作区：${name}`, "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    }
+  };
+
+  const handleDeleteTask = async (taskId: string, title: string, isRunning: boolean) => {
+    const ok = await confirm({
+      title: "删除任务",
+      message: `确定要永久删除任务「${title}」吗？`,
+      detail: isRunning
+        ? "该任务正在运行，确认后将先中止执行，并永久删除其对话记录与状态记忆，此操作无法撤销。"
+        : "将永久删除该任务的全部对话记录与状态记忆，此操作无法撤销。",
+      confirmLabel: "确认删除",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.deleteTask(taskId);
+      toast(`已删除任务：${title}`, "good");
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     }
@@ -201,7 +230,13 @@ export function HomePage() {
                       size="sm"
                       icon="trash"
                       title={t("删除")}
-                      onClick={() => void api.deleteTask(tk.id)}
+                      onClick={() =>
+                        void handleDeleteTask(
+                          tk.id,
+                          tk.title,
+                          tk.status === "PULSING" || tk.status === "WAITING_APPROVAL"
+                        )
+                      }
                     />
                   </div>
                 </div>

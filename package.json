@@ -1,0 +1,38 @@
+{
+  "name": "avent",
+  "version": "0.1.0",
+  "description": "Event-driven, sessionless agents powered by SSSM compaction and multi-subscription ACP drivers.",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/build-web.mjs --watch & tsx watch src/server/index.ts",
+    "start": "node scripts/build-web.mjs && tsx src/server/index.ts",
+    "build:web": "node scripts/build-web.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.108.0",
+    "@agentclientprotocol/codex-acp": "^2.7.0",
+    "@agentclientprotocol/sdk": "^2.7.0",
+    "@hono/node-server": "^1.19.9",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@vscode/ripgrep": "^1.15.10",
+    "cross-spawn": "^7.0.5",
+    "hono": "^4.11.4",
+    "js-tiktoken": "^1.0.19",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.18.5",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "esbuild": "^0.25.5",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

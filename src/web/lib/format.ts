@@ -1,5 +1,29 @@
 import type { KeyboardEvent } from "react";
-import type { TaskStatus } from "../../shared/types.js";
+import type { PermissionMode, TaskStatus } from "../../shared/types.js";
+
+export function getPermissionModeOptions(t: (key: string) => string): Array<{
+  value: PermissionMode;
+  label: string;
+  desc: string;
+}> {
+  return [
+    {
+      value: "default",
+      label: t("默认询问"),
+      desc: "仅放行只读操作，其余均需确认",
+    },
+    {
+      value: "acceptEdits",
+      label: t("自动接受编辑"),
+      desc: "自动改工作区内代码，删文件与命令仍需确认",
+    },
+    {
+      value: "bypassPermissions",
+      label: t("全自动执行"),
+      desc: "工作区内自动执行，仅拦截高危与越界操作",
+    },
+  ];
+}
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");

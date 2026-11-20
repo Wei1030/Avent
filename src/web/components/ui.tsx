@@ -287,6 +287,7 @@ export function Select<T extends string = string>({
   borderless,
   icon,
   placement = "bottom",
+  align = "left",
   className,
   footer,
 }: {
@@ -297,6 +298,7 @@ export function Select<T extends string = string>({
   borderless?: boolean;
   icon?: string;
   placement?: "bottom" | "top";
+  align?: "left" | "right";
   className?: string;
   footer?: ReactNode;
 }) {
@@ -321,7 +323,8 @@ export function Select<T extends string = string>({
         open={open}
         onClose={() => setOpen(false)}
         placement={placement}
-        style={{ minWidth: Math.max(200, btnRef.current?.offsetWidth ?? 200) }}
+        align={align}
+        style={{ minWidth: Math.max(220, btnRef.current?.offsetWidth ?? 220) }}
       >
         {options.map((opt) => (
           <button

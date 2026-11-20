@@ -143,7 +143,7 @@ const DEFAULT_PREFS: AppPreferences = {
   defaultProviderId: "agy",
   defaultModelId: "",
   defaultThoughtLevel: "",
-  defaultPermissionMode: "acceptEdits",
+  defaultPermissionMode: "bypassPermissions",
   desktopNotifications: true,
 };
 

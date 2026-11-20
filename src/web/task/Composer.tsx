@@ -11,7 +11,7 @@ import { useApp, type NewTaskConfig } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
 import { ModelPicker, resolveThoughtLevelsForSelection } from "../components/ModelPicker.js";
 import { Button, Chip, Popover, Select } from "../components/ui.js";
-import { cx, isPlainEnter } from "../lib/format.js";
+import { cx, getPermissionModeOptions, isPlainEnter } from "../lib/format.js";
 
 export function Composer({
   task,
@@ -500,23 +500,7 @@ export function Composer({
             placement="top"
             icon="shield"
             value={task.permissionMode}
-            options={[
-              {
-                value: "default",
-                label: t("默认询问"),
-                desc: "工作区内只读工具与纯只读命令自动放行，其余读写删除与命令均需确认",
-              },
-              {
-                value: "acceptEdits",
-                label: t("自动接受编辑"),
-                desc: "自动允许修改当前工作区内的代码文件，删除文件、越界操作与非常规命令仍会询问",
-              },
-              {
-                value: "bypassPermissions",
-                label: t("全自动执行"),
-                desc: "自动执行工作区内的编辑、删除与常规命令，高危破坏命令、越界操作与拒绝/询问规则仍会拦截",
-              },
-            ]}
+            options={getPermissionModeOptions(t)}
             onChange={(permissionMode) => {
               if (isNewDraft) {
                 onDraftConfigChange?.({ permissionMode });

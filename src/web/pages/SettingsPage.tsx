@@ -16,7 +16,7 @@ import { useApp } from "../store/app-context.js";
 import { Icon } from "../components/Icon.js";
 import { ModelPicker, resolveThoughtLevelsForSelection } from "../components/ModelPicker.js";
 import { Button, Chip, Seg, Select, Status, Tabs } from "../components/ui.js";
-import { cx, isPlainEnter } from "../lib/format.js";
+import { cx, getPermissionModeOptions, isPlainEnter } from "../lib/format.js";
 
 export function SettingsPage() {
   const { t } = useApp();
@@ -155,12 +155,9 @@ function GeneralSettings() {
               size="sm"
               className="w-220"
               icon="shield"
+              align="right"
               value={prefs.defaultPermissionMode}
-              options={[
-                { value: "default", label: t("默认询问") },
-                { value: "acceptEdits", label: t("自动接受编辑") },
-                { value: "bypassPermissions", label: t("全自动执行") },
-              ]}
+              options={getPermissionModeOptions(t)}
               onChange={(v) => {
                 void updatePrefs({ defaultPermissionMode: v });
                 toast("已更新默认权限模式", "good");

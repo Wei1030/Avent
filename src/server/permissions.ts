@@ -7,6 +7,7 @@ import type {
 } from "../shared/types.js";
 import {
   analyzeShellCommand,
+  isCatastrophicDeleteTarget,
   isPathInsideRoot,
   type ShellCommandAnalysis,
 } from "./shell-parser.js";
@@ -225,8 +226,15 @@ export function describeToolCall(
 
   let isRisky = false;
   if (category === "delete") {
-    isRisky = true;
-    reasons.push("文件删除或移动属于高影响/不可逆操作，默认需要人工确认");
+    const hitsCatastrophic = [filePathStr, destPathStr]
+      .filter(Boolean)
+      .some((p) => isCatastrophicDeleteTarget(p, cwd, cwd));
+    if (hitsCatastrophic) {
+      isRisky = true;
+      reasons.push("高危删除操作：目标涉及工作区根目录或 .git 版本库");
+    } else {
+      reasons.push("工作区内删除或移动文件，全自动模式下自动放行，其余模式需确认");
+    }
   } else if (category === "other") {
     reasons.push(`外部或未分类工具 (${canonical})，按 Fail-Closed 原则需人工确认`);
   }
@@ -236,7 +244,7 @@ export function describeToolCall(
 
   // Build suggested rule (avoid suggesting broad rules for outside-workspace or delete actions)
   let suggestedRule = "";
-  if (!outsideWorkspace && !isRisky) {
+  if (!outsideWorkspace && !isRisky && category !== "delete") {
     if (filePathStr) {
       const normalizedPath = filePathStr.replace(/\\/g, "/");
       const slashIdx = normalizedPath.indexOf("/");
@@ -393,9 +401,9 @@ export function evaluateToolPermission(params: {
     };
   }
 
-  // 4. Full-auto mode (only for in-workspace, non-risky operations)
+  // 4. Full-auto mode (only for in-workspace, non-catastrophic operations, including local file deletes)
   if (mode === "bypassPermissions") {
-    return { action: "allow", provenance: "全自动执行模式（工作区内常规操作）" };
+    return { action: "allow", provenance: "全自动执行模式（工作区内常规操作与删除）" };
   }
 
   // 5. Shell commands: strict per-segment Fail-Closed evaluation

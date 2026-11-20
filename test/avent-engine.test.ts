@@ -651,37 +651,47 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       assert.equal(evalCmd("npm.cmd test").res.action, "allow");
       assert.equal(evalCmd("npm.cmd test && git status").res.action, "allow");
 
-      // 3. Compound command bypass attempts MUST fail closed or deny!
-      const chainedRm = evalCmd("npm.cmd test && rm -r -f src");
-      assert.equal(chainedRm.desc.isRisky, true);
+      // 3. Compound command bypass attempts MUST fail closed or deny in default/acceptEdits!
+      const chainedRm = evalCmd("npm.cmd test && rm -r -f src", "acceptEdits");
       assert.equal(chainedRm.res.action, "ask");
       assert.ok(chainedRm.res.provenance.includes("rm"));
 
-      const chainedForcePush = evalCmd("npm.cmd test && git push --force origin main");
-      assert.equal(chainedForcePush.res.action, "deny"); // hits seeded global deny rule!
+      const chainedForcePush = evalCmd("npm.cmd test && git push --force origin main", "bypassPermissions");
+      assert.equal(chainedForcePush.res.action, "deny"); // hits seeded global deny rule even in full-auto!
 
-      const chainedUnknown = evalCmd("npm.cmd test; node sneaky.js");
+      const chainedUnknown = evalCmd("npm.cmd test; node sneaky.js", "default");
       assert.equal(chainedUnknown.res.action, "ask");
 
       // 4. Output redirection & command substitution block allow rules and read-only whitelist
-      const redirRead = evalCmd("git diff > src/hacked.ts");
+      const redirRead = evalCmd("git diff > src/hacked.ts", "default");
       assert.equal(redirRead.desc.shellAnalysis?.hasRedirection, true);
       assert.equal(redirRead.desc.shellAnalysis?.segments[0].classification, "write_or_unknown");
       assert.equal(redirRead.res.action, "ask");
 
-      const redirAllowed = evalCmd("npm.cmd test > out.log");
+      const redirAllowed = evalCmd("npm.cmd test > out.log", "acceptEdits");
       assert.equal(redirAllowed.desc.shellAnalysis?.hasRedirection, true);
       assert.equal(redirAllowed.res.action, "ask");
 
-      const cmdSub = evalCmd("git status && echo $(rm -rf .)");
+      const cmdSub = evalCmd("git status && echo $(rm -rf .)", "default");
       assert.equal(cmdSub.desc.shellAnalysis?.hasCommandSub, true);
       assert.equal(cmdSub.res.action, "ask");
 
-      // 5. Destructive variations, PowerShell aliases, pipe-to-shell, and encoded eval stop even in bypassPermissions!
-      for (const riskyCmd of [
+      // 5a. Normal in-workspace deletion asks in default/acceptEdits, but AUTO-ALLOWS in bypassPermissions!
+      for (const localDelCmd of [
         "rm -r -f dist",
         "Remove-Item -Recurse -Force dist",
         "ri -r -fo dist",
+      ]) {
+        assert.equal(evalCmd(localDelCmd, "acceptEdits").res.action, "ask", `Expected ask in acceptEdits: ${localDelCmd}`);
+        assert.equal(evalCmd(localDelCmd, "bypassPermissions").res.action, "allow", `Expected allow in bypassPermissions: ${localDelCmd}`);
+      }
+
+      // 5b. Catastrophic / root / .git / outside / remote-pipe / encoded commands STILL stop even in bypassPermissions!
+      for (const riskyCmd of [
+        "rm -rf .",
+        "rm -rf .git",
+        "Remove-Item -Recurse -Force .",
+        "rm -rf ../other-project",
         "cmd /c rd /s /q dist",
         "git reset --hard HEAD~1",
         "git branch -D dev",
@@ -691,7 +701,6 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         "find . -delete",
       ]) {
         const out = evalCmd(riskyCmd, "bypassPermissions");
-        assert.equal(out.desc.isRisky, true, `Expected risky: ${riskyCmd}`);
         assert.equal(out.res.action, "ask", `Expected ask in bypassPermissions: ${riskyCmd}`);
       }
 
@@ -739,7 +748,7 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         "allow"
       );
 
-      // Delete tool is NEVER auto-allowed by acceptEdits or bypassPermissions!
+      // In-workspace Delete asks in acceptEdits, auto-allows in bypassPermissions; deleting .git/root/outside STILL asks!
       const insideDelete = describeToolCall(
         "Delete",
         "src/old.ts",
@@ -747,7 +756,7 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         { rawKind: "delete", cwd: tmpDir }
       );
       assert.equal(insideDelete.category, "delete");
-      assert.equal(insideDelete.isRisky, true);
+      assert.equal(insideDelete.isRisky, false);
       assert.equal(
         evaluateToolPermission({
           mode: "acceptEdits",
@@ -762,6 +771,40 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
           mode: "bypassPermissions",
           rules,
           descriptor: insideDelete,
+          rawName: "Delete",
+        }).action,
+        "allow"
+      );
+
+      const gitDelete = describeToolCall(
+        "Delete",
+        ".git/HEAD",
+        { file_path: ".git/HEAD" },
+        { rawKind: "delete", cwd: tmpDir }
+      );
+      assert.equal(gitDelete.isRisky, true);
+      assert.equal(
+        evaluateToolPermission({
+          mode: "bypassPermissions",
+          rules,
+          descriptor: gitDelete,
+          rawName: "Delete",
+        }).action,
+        "ask"
+      );
+
+      const outsideDelete = describeToolCall(
+        "Delete",
+        "../../outside.ts",
+        { file_path: "../../outside.ts" },
+        { rawKind: "delete", cwd: tmpDir }
+      );
+      assert.equal(outsideDelete.outsideWorkspace, true);
+      assert.equal(
+        evaluateToolPermission({
+          mode: "bypassPermissions",
+          rules,
+          descriptor: outsideDelete,
           rawName: "Delete",
         }).action,
         "ask"

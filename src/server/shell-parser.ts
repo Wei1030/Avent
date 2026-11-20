@@ -348,10 +348,9 @@ const DYNAMIC_EVAL_EXECUTABLES = new Set([
   "start",
 ]);
 
-const DESTRUCTIVE_EXECUTABLES = new Set([
+const FILE_DELETE_EXECUTABLES = new Set([
   "rm",
   "unlink",
-  "shred",
   "del",
   "erase",
   "rd",
@@ -360,6 +359,10 @@ const DESTRUCTIVE_EXECUTABLES = new Set([
   "ri",
   "clear-content",
   "clc",
+]);
+
+const SYSTEM_DESTRUCTIVE_EXECUTABLES = new Set([
+  "shred",
   "format",
   "diskpart",
   "mkfs",
@@ -373,6 +376,49 @@ const DESTRUCTIVE_EXECUTABLES = new Set([
   "takeown",
   "cacls",
 ]);
+
+/**
+ * Checks whether a delete target would wipe the workspace root itself, wildcard everything at root,
+ * or touch `.git` metadata (which destroys version history and cannot be undone with git).
+ */
+export function isCatastrophicDeleteTarget(
+  rawTarget: string,
+  virtualCwd: string,
+  rootCwd: string
+): boolean {
+  const cleaned = rawTarget.trim().replace(/^['"]|['"]$/g, "");
+  if (!cleaned) return false;
+  const normSlash = cleaned.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  if (
+    normSlash === "." ||
+    normSlash === "./" ||
+    normSlash === "*" ||
+    normSlash === "./*" ||
+    normSlash === "/" ||
+    /^[a-z]:$/i.test(normSlash) ||
+    /^[a-z]:\/\*?$/i.test(normSlash)
+  ) {
+    return true;
+  }
+  if (/(^|\/)\.git($|\/)/i.test(normSlash)) {
+    return true;
+  }
+  if (rootCwd) {
+    const resolved = path.isAbsolute(cleaned)
+      ? path.resolve(cleaned)
+      : path.resolve(virtualCwd || rootCwd, cleaned);
+    const canonRoot = resolveCanonicalPath(rootCwd);
+    const canonTarget = resolveCanonicalPath(resolved);
+    const sameAsRoot =
+      process.platform === "win32"
+        ? canonRoot.toLowerCase() === canonTarget.toLowerCase()
+        : canonRoot === canonTarget;
+    if (sameAsRoot) return true;
+    const rel = path.relative(canonRoot, canonTarget).replace(/\\/g, "/");
+    if (rel === ".git" || rel.startsWith(".git/")) return true;
+  }
+  return false;
+}
 
 const NETWORK_FETCH_EXECUTABLES = new Set([
   "curl",
@@ -816,9 +862,23 @@ export function analyzeShellCommand(
         classification = "destructive";
         segReasons.push("动态执行内容中包含高危删除或破坏性操作");
       }
-    } else if (DESTRUCTIVE_EXECUTABLES.has(executable)) {
+    } else if (SYSTEM_DESTRUCTIVE_EXECUTABLES.has(executable)) {
       classification = "destructive";
-      segReasons.push(`高危删除或系统修改命令 (${executable})`);
+      segReasons.push(`高危系统或磁盘修改命令 (${executable})`);
+    } else if (FILE_DELETE_EXECUTABLES.has(executable)) {
+      const targetArgs = args.filter(
+        (a) => a && !a.startsWith("-") && !/^\/[a-z]+$/i.test(a)
+      );
+      const hitsCatastrophic =
+        targetArgs.length === 0 ||
+        targetArgs.some((t) => isCatastrophicDeleteTarget(t, virtualCwd, rootCwd));
+      if (hitsCatastrophic) {
+        classification = "destructive";
+        segReasons.push(`高危删除操作：可能清空整个工作区根目录或 .git 历史 (${executable})`);
+      } else {
+        classification = "write_or_unknown";
+        segReasons.push(`工作区内删除文件/目录命令 (${executable})，全自动模式下自动放行，其余模式需确认`);
+      }
     } else if (
       (executable === "bash" || executable === "sh" || executable === "zsh" || executable === "dash") &&
       args.some((a) => a === "-c" || a === "-lc")

@@ -66,8 +66,12 @@ export function ApprovalPanel({ approvals }: { approvals: ApprovalRequest[] }) {
               ? "高风险操作需要你确认"
               : "请求执行工具操作"}
         </b>
-        <Chip mono>{current.toolName}</Chip>
         {current.category && <Chip>{CATEGORY_LABEL[current.category]}</Chip>}
+        {current.toolName !== "Bash" &&
+          current.toolName !== "Edit" &&
+          current.toolName !== "Write" &&
+          current.toolName !== "Delete" &&
+          current.toolName !== "Read" && <Chip mono>{current.toolName}</Chip>}
         {current.outsideWorkspace && <Chip tone="crit">越出工作目录</Chip>}
         {current.risky && <Chip tone="crit">高风险</Chip>}
         {approvals.length > 1 && <Chip tone="warn">还有 {approvals.length - 1} 项待确认</Chip>}

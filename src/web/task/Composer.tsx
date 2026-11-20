@@ -514,7 +514,7 @@ export function Composer({
               {
                 value: "bypassPermissions",
                 label: t("全自动执行"),
-                desc: "自动执行工作区内常规操作，高危删除、越界修改与拒绝/询问规则仍会拦截",
+                desc: "自动执行工作区内的编辑、删除与常规命令，高危破坏命令、越界操作与拒绝/询问规则仍会拦截",
               },
             ]}
             onChange={(permissionMode) => {

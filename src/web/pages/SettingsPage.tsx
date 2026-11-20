@@ -173,18 +173,60 @@ function GeneralSettings() {
   );
 }
 
+type RuleTargetTool = "Bash" | "Edit" | "Write" | "Delete" | "Read";
+
+const RULE_TARGET_LABELS: Record<string, string> = {
+  bash: "终端命令",
+  shell: "终端命令",
+  edit: "编辑文件",
+  write: "写入文件",
+  delete: "删除文件",
+  move: "删除 / 移动",
+  read: "读取文件",
+  grep: "代码搜索",
+  glob: "文件检索",
+};
+
+function parseRuleForDisplay(rule: string): { targetLabel: string; spec: string } {
+  const trimmed = rule.trim();
+  const m = /^([A-Za-z0-9_:-]+)\(([\s\S]*)\)$/.exec(trimmed);
+  if (m) {
+    const [, tool, spec] = m;
+    const label = RULE_TARGET_LABELS[tool.toLowerCase()] ?? tool;
+    return { targetLabel: label, spec: spec.trim() || "*" };
+  }
+  const label = RULE_TARGET_LABELS[trimmed.toLowerCase()];
+  if (label) {
+    return { targetLabel: label, spec: "全部" };
+  }
+  return { targetLabel: "工具", spec: trimmed };
+}
+
+function buildRuleExpression(targetTool: RuleTargetTool, rawInput: string): string {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return "";
+  // If user pasted an explicit `Tool(...)` expression directly, preserve it without double-wrapping
+  if (/^[A-Za-z0-9_:-]+\([\s\S]*\)$/.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed === "*" || trimmed === "全部") {
+    return targetTool;
+  }
+  return `${targetTool}(${trimmed})`;
+}
+
 function PermissionsSettings() {
   const { activeWorkspace, prefs, toast, t } = useApp();
   const [rules, setRules] = useState<PermissionRuleRecord[]>([]);
   const [behavior, setBehavior] = useState<"allow" | "ask" | "deny">("allow");
+  const [ruleTarget, setRuleTarget] = useState<RuleTargetTool>("Bash");
   const [scope, setScope] = useState<"workspace" | "global">(() =>
     activeWorkspace ? "workspace" : "global"
   );
   const [pattern, setPattern] = useState("");
   const [note, setNote] = useState("");
 
-  // Compact single-row command/path tester
-  const [testKind, setTestKind] = useState<"shell" | "edit" | "delete" | "read">("shell");
+  // Focused terminal command tester
   const [testMode, setTestMode] = useState<PermissionMode>(prefs.defaultPermissionMode);
   const [testInput, setTestInput] = useState("");
   const [testing, setTesting] = useState(false);
@@ -212,16 +254,12 @@ function PermissionsSettings() {
     void load();
   }, [activeWorkspace?.id]);
 
-  const runEvaluate = async (
-    nextKind = testKind,
-    nextInput = testInput,
-    nextMode = testMode
-  ) => {
+  const runEvaluate = async (nextInput = testInput, nextMode = testMode) => {
     if (!nextInput.trim()) return;
     setTesting(true);
     try {
       const res = await api.evaluateRule({
-        toolKind: nextKind,
+        toolKind: "shell",
         inputText: nextInput,
         mode: nextMode,
         workspaceId: activeWorkspace?.id,
@@ -235,11 +273,12 @@ function PermissionsSettings() {
   };
 
   const handleAdd = async () => {
-    if (!pattern.trim()) return;
+    const expr = buildRuleExpression(ruleTarget, pattern);
+    if (!expr) return;
     try {
       await api.addRule({
         behavior,
-        rule: pattern.trim(),
+        rule: expr,
         scope,
         workspaceId: scope === "workspace" ? activeWorkspace?.id : undefined,
         note: note.trim() || undefined,
@@ -296,7 +335,7 @@ function PermissionsSettings() {
               <tr>
                 <td>
                   <b>读取与搜索</b>
-                  <span className="hint">读文件、代码搜索、纯只读命令（如 git status / ls / rg）</span>
+                  <span className="hint">读文件、代码搜索、纯只读终端命令（如 git status / ls / rg）</span>
                 </td>
                 <td><Status tone="good">自动</Status></td>
                 <td><Status tone="good">自动</Status></td>
@@ -305,7 +344,7 @@ function PermissionsSettings() {
               <tr>
                 <td>
                   <b>修改与新建文件</b>
-                  <span className="hint">仅限当前任务工作目录内（Edit / Write）</span>
+                  <span className="hint">仅限当前任务工作目录内</span>
                 </td>
                 <td><Status tone="warn">需确认</Status></td>
                 <td><Status tone="good">自动</Status></td>
@@ -313,8 +352,8 @@ function PermissionsSettings() {
               </tr>
               <tr>
                 <td>
-                  <b>运行一般终端命令与外部工具</b>
-                  <span className="hint">构建、脚本、git 提交、写重定向、MCP 工具等</span>
+                  <b>终端命令、删除工作区文件与外部工具</b>
+                  <span className="hint">构建、测试、脚本、删除工作区内文件、git 提交、MCP 工具等</span>
                 </td>
                 <td><Status tone="warn">需确认</Status></td>
                 <td><Status tone="warn">需确认</Status></td>
@@ -322,8 +361,8 @@ function PermissionsSettings() {
               </tr>
               <tr>
                 <td>
-                  <b>删除文件 / 高危命令 / 越出工作目录</b>
-                  <span className="hint">rm / Remove-Item / git reset --hard / 访问目录外文件</span>
+                  <b>高危破坏命令与越出工作目录</b>
+                  <span className="hint">删除 .git / 根目录、git reset --hard、远端强推、访问目录外路径</span>
                 </td>
                 <td><Status tone="crit">强制确认</Status></td>
                 <td><Status tone="crit">强制确认</Status></td>
@@ -332,7 +371,7 @@ function PermissionsSettings() {
             </tbody>
           </table>
           <div className="hint" style={{ marginTop: 10 }}>
-            下方的自定义规则优先级高于权限模式（拒绝 &gt; 询问 &gt; 安全底线 &gt; 允许）；复合命令（如{" "}
+            下方的自定义规则优先级高于权限模式（拒绝 &gt; 询问 &gt; 安全底线 &gt; 允许）；复合终端命令（如{" "}
             <code className="mono">&&</code> / <code className="mono">;</code> / <code className="mono">|</code>）会先拆解再逐条检查。
           </div>
         </div>
@@ -352,34 +391,38 @@ function PermissionsSettings() {
               暂无自定义规则，将按上方权限模式与安全底线判定。
             </div>
           ) : (
-            rules.map((r) => (
-              <div key={r.id} className="rule-row">
-                <Status
-                  tone={
-                    r.behavior === "allow"
-                      ? "good"
-                      : r.behavior === "deny"
-                        ? "crit"
-                        : "warn"
-                  }
-                >
-                  {r.behavior === "allow" ? "允许" : r.behavior === "deny" ? "拒绝" : "询问"}
-                </Status>
-                <code className="mono" style={{ fontWeight: 600 }}>
-                  {r.rule}
-                </code>
-                <Chip>{r.scope === "global" ? "全局" : "当前工作区"}</Chip>
-                {r.note && <span className="muted truncate">{r.note}</span>}
-                <span className="grow" />
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  icon="trash"
-                  title="删除规则"
-                  onClick={() => void handleDeleteRule(r.id)}
-                />
-              </div>
-            ))
+            rules.map((r) => {
+              const parsed = parseRuleForDisplay(r.rule);
+              return (
+                <div key={r.id} className="rule-row">
+                  <Status
+                    tone={
+                      r.behavior === "allow"
+                        ? "good"
+                        : r.behavior === "deny"
+                          ? "crit"
+                          : "warn"
+                    }
+                  >
+                    {r.behavior === "allow" ? "允许" : r.behavior === "deny" ? "拒绝" : "询问"}
+                  </Status>
+                  <Chip outline>{parsed.targetLabel}</Chip>
+                  <code className="mono" style={{ fontWeight: 600 }} title={r.rule}>
+                    {parsed.spec}
+                  </code>
+                  <Chip>{r.scope === "global" ? "全局" : "当前工作区"}</Chip>
+                  {r.note && <span className="muted truncate">{r.note}</span>}
+                  <span className="grow" />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon="trash"
+                    title="删除规则"
+                    onClick={() => void handleDeleteRule(r.id)}
+                  />
+                </div>
+              );
+            })
           )}
         </div>
 
@@ -396,6 +439,33 @@ function PermissionsSettings() {
               ]}
               onChange={setBehavior}
             />
+            <Select<RuleTargetTool>
+              size="sm"
+              className="perm-sel-md"
+              value={ruleTarget}
+              options={[
+                { value: "Bash", label: "终端命令" },
+                { value: "Edit", label: "编辑文件" },
+                { value: "Write", label: "写入文件" },
+                { value: "Delete", label: "删除文件" },
+                { value: "Read", label: "读取文件" },
+              ]}
+              onChange={setRuleTarget}
+            />
+            <input
+              className="input sm mono grow"
+              style={{ minWidth: 180 }}
+              placeholder={
+                ruleTarget === "Bash"
+                  ? "命令前缀或通配，如 npm.cmd run build*"
+                  : "路径通配，如 src/**"
+              }
+              value={pattern}
+              onChange={(e) => setPattern(e.target.value)}
+              onKeyDown={(e) => {
+                if (isPlainEnter(e)) void handleAdd();
+              }}
+            />
             <Select<"workspace" | "global">
               size="sm"
               className="perm-sel-md"
@@ -407,18 +477,8 @@ function PermissionsSettings() {
               onChange={setScope}
             />
             <input
-              className="input sm mono grow"
-              style={{ minWidth: 200 }}
-              placeholder="规则表达式，如 Bash(npm.cmd run build*) 或 Edit(src/**)"
-              value={pattern}
-              onChange={(e) => setPattern(e.target.value)}
-              onKeyDown={(e) => {
-                if (isPlainEnter(e)) void handleAdd();
-              }}
-            />
-            <input
               className="input sm"
-              style={{ width: 150 }}
+              style={{ width: 130 }}
               placeholder="备注（可选）"
               value={note}
               onChange={(e) => setNote(e.target.value)}
@@ -433,43 +493,25 @@ function PermissionsSettings() {
             </Button>
           </div>
           <div className="hint">
-            示例：<code className="mono">Bash(npm.cmd run build*)</code>（允许构建）、
-            <code className="mono">Edit(src/**)</code>（允许改目录）、
-            <code className="mono">Bash(rm*)</code>（拒绝删除）
+            支持 <code className="mono">*</code> 通配符（如终端命令填{" "}
+            <code className="mono">npm.cmd run build*</code>、编辑文件填{" "}
+            <code className="mono">src/**</code>；也兼容直接粘贴{" "}
+            <code className="mono">Bash(...)</code> 等规则表达式）。
           </div>
         </div>
       </div>
 
-      {/* 3. Ultra-clean 1-Row Permission Tester */}
+      {/* 3. Focused Single-Row Terminal Command Tester */}
       <div className="panel">
         <div className="panel-head">
-          <h3>测试一条命令或路径</h3>
-          <span className="sub">不确定某条命令会不会被拦？输入后点「测试」即可查看实际判定</span>
+          <h3>测试终端命令</h3>
+          <span className="sub">不确定某条命令（或复合拼接、重定向）会不会命中上方规则或被拦截？输入即可实测</span>
         </div>
         <div className="panel-body col" style={{ gap: 10 }}>
           <div className="row" style={{ gap: 8 }}>
-            <Select<"shell" | "edit" | "delete" | "read">
-              size="sm"
-              className="perm-sel-md"
-              value={testKind}
-              options={[
-                { value: "shell", label: "终端命令" },
-                { value: "edit", label: "编辑文件" },
-                { value: "delete", label: "删除文件" },
-                { value: "read", label: "读取文件" },
-              ]}
-              onChange={(k) => {
-                setTestKind(k);
-                setTestResult(null);
-              }}
-            />
             <input
               className="input sm mono grow"
-              placeholder={
-                testKind === "shell"
-                  ? "输入终端命令，例如 npm.cmd test && rm -rf src"
-                  : "输入文件路径，例如 src/app.ts 或 ../../secret.txt"
-              }
+              placeholder="输入任意终端命令，例如 npm.cmd test && rm -rf dist 或 git push --force origin main"
               value={testInput}
               onChange={(e) => setTestInput(e.target.value)}
               onKeyDown={(e) => {
@@ -487,7 +529,7 @@ function PermissionsSettings() {
               ]}
               onChange={(m) => {
                 setTestMode(m);
-                if (testInput.trim()) void runEvaluate(testKind, testInput, m);
+                if (testInput.trim()) void runEvaluate(testInput, m);
               }}
             />
             <Button

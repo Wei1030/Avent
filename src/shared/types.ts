@@ -520,6 +520,8 @@ export interface AppPreferences {
   defaultThoughtLevel: string;
   defaultPermissionMode: PermissionMode;
   desktopNotifications: boolean;
+  /** Per-round net token growth budget before automatic state handoff & session reset (default 14000). */
+  contextNetTokenLimit: number;
 }
 
 export interface InstructionDoc {

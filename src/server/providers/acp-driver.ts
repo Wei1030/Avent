@@ -205,6 +205,7 @@ export async function executeAcpPulse(
 
   let actionCount = 0;
   let baselineTokens = 0;
+  let baselineCaptured = false;
   let estimatedInputTokens = estimateTokens(input.workPrompt);
   let estimatedOutputTokens = 0;
   let reportedUsedTokens = 0;
@@ -220,8 +221,8 @@ export async function executeAcpPulse(
 
   const computeNetTokens = (): number => {
     const est = estimatedInputTokens + estimatedOutputTokens;
-    if (reportedUsedTokens > 0 && baselineTokens > 0) {
-      return Math.max(est, reportedUsedTokens - baselineTokens);
+    if (reportedUsedTokens > 0 && baselineCaptured) {
+      return Math.max(est, Math.max(0, reportedUsedTokens - baselineTokens));
     }
     return est;
   };
@@ -290,7 +291,8 @@ export async function executeAcpPulse(
       }
 
       const currentNet = computeNetTokens();
-      if (actionCount >= input.maxActions || currentNet >= input.netTokenLimit) {
+      const hitActionLimit = input.maxActions > 0 && actionCount >= input.maxActions;
+      if (hitActionLimit || currentNet >= input.netTokenLimit) {
         budgetExhausted = true;
         return selectReject();
       }
@@ -654,11 +656,12 @@ export async function executeAcpPulse(
         }
         emitTelemetry();
 
+        const hitActionLimit = input.maxActions > 0 && actionCount > input.maxActions;
         if (
           phase === "WORK" &&
           !cancelSentForWatermark &&
           input.getCommittedState() === null &&
-          (actionCount > input.maxActions || computeNetTokens() >= input.netTokenLimit) &&
+          (hitActionLimit || computeNetTokens() >= input.netTokenLimit) &&
           activeSessionId
         ) {
           budgetExhausted = true;
@@ -691,8 +694,9 @@ export async function executeAcpPulse(
         }
       } else if (u.sessionUpdate === "usage_update") {
         const estSum = estimatedInputTokens + estimatedOutputTokens;
-        if (baselineTokens === 0 && u.used > 0) {
+        if (!baselineCaptured && u.used > 0) {
           baselineTokens = Math.max(0, u.used - estSum);
+          baselineCaptured = true;
         }
         reportedUsedTokens = u.used;
         peakTotalTokens = Math.max(peakTotalTokens, u.used);

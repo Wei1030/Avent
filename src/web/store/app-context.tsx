@@ -156,6 +156,7 @@ const DEFAULT_PREFS: AppPreferences = {
   defaultThoughtLevel: "",
   defaultPermissionMode: "bypassPermissions",
   desktopNotifications: true,
+  contextNetTokenLimit: 14000,
 };
 
 const AppCtx = createContext<AppContextValue | null>(null);

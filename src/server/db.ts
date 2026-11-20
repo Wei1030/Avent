@@ -53,7 +53,17 @@ const DEFAULT_PREFS: AppPreferences = {
   defaultThoughtLevel: "",
   defaultPermissionMode: "bypassPermissions",
   desktopNotifications: true,
+  contextNetTokenLimit: 14000,
 };
+
+export const MIN_CONTEXT_NET_TOKEN_LIMIT = 4000;
+export const MAX_CONTEXT_NET_TOKEN_LIMIT = 200000;
+
+function sanitizeContextNetTokenLimit(val: unknown): number {
+  const n = Number(val);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_PREFS.contextNetTokenLimit;
+  return Math.max(MIN_CONTEXT_NET_TOKEN_LIMIT, Math.min(MAX_CONTEXT_NET_TOKEN_LIMIT, Math.round(n)));
+}
 
 export class AventStore {
   public readonly dataDir: string;
@@ -2201,14 +2211,27 @@ export class AventStore {
       .get() as { value_json: string } | undefined;
     if (!row) return { ...DEFAULT_PREFS };
     try {
-      return { ...DEFAULT_PREFS, ...(JSON.parse(row.value_json) as Partial<AppPreferences>) };
+      const parsed = JSON.parse(row.value_json) as Partial<AppPreferences>;
+      return {
+        ...DEFAULT_PREFS,
+        ...parsed,
+        contextNetTokenLimit: sanitizeContextNetTokenLimit(parsed.contextNetTokenLimit),
+      };
     } catch {
       return { ...DEFAULT_PREFS };
     }
   }
 
   public savePreferences(patch: Partial<AppPreferences>): AppPreferences {
-    const merged: AppPreferences = { ...this.getPreferences(), ...patch };
+    const cur = this.getPreferences();
+    const merged: AppPreferences = {
+      ...cur,
+      ...patch,
+      contextNetTokenLimit:
+        patch.contextNetTokenLimit !== undefined
+          ? sanitizeContextNetTokenLimit(patch.contextNetTokenLimit)
+          : cur.contextNetTokenLimit,
+    };
     this.db
       .prepare(
         `INSERT INTO prefs (key, value_json) VALUES ('app_preferences', ?)

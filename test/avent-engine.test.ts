@@ -7,7 +7,7 @@ import path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { AventStore } from "../src/server/db.js";
 import { ProviderRegistry } from "../src/server/providers/registry.js";
-import { PulseEngine } from "../src/server/pulse-engine.js";
+import { getBudgetForMode, PulseEngine } from "../src/server/pulse-engine.js";
 import { describeToolCall, evaluateToolPermission } from "../src/server/permissions.js";
 import {
   mergeClaudeRateLimitEvent,
@@ -1692,6 +1692,166 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       assert.equal(codexSnap.groups[0].buckets[1].window, "weekly");
       assert.equal(codexSnap.groups[0].buckets[1].remainingPercent, 65);
       assert.ok(codexSnap.extraNote?.includes("$12.50"));
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
+
+  it("removes fixed tool-call count cap in default EoCC mode and honors configurable contextNetTokenLimit", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-ctx-limit-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    const store = new AventStore(dbDir, tmpDir);
+    try {
+      // 1. Default preference is 14000 and maxActions = 0 (unlimited tool calls)
+      assert.equal(store.getPreferences().contextNetTokenLimit, 14000);
+      assert.deepEqual(getBudgetForMode("micro-stretch", 14000), {
+        maxActions: 0,
+        netTokenLimit: 14000,
+      });
+
+      // Clamping works for out-of-range values
+      assert.equal(store.savePreferences({ contextNetTokenLimit: 100 }).contextNetTokenLimit, 4000);
+      assert.equal(
+        store.savePreferences({ contextNetTokenLimit: 999999 }).contextNetTokenLimit,
+        200000
+      );
+      assert.equal(store.savePreferences({ contextNetTokenLimit: 14000 }).contextNetTokenLimit, 14000);
+
+      // 2. Execute 7 consecutive lightweight tool calls (> old limit of 5) in ONE round -> all 7 MUST be allowed!
+      // Then emit a usage_update crossing the configured 5000-token net limit -> 8th tool call MUST be rejected & compacted!
+      store.savePreferences({ contextNetTokenLimit: 5000 });
+      const registry = new ProviderRegistry(process.cwd(), store);
+      const permissionOutcomes: string[] = [];
+      let promptCount = 0;
+
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        mockAgentFactory: () =>
+          acp
+            .agent({ name: "mock-eocc-agent" })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock-eocc", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async () => ({ sessionId: "sess-eocc-1" }))
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              promptCount += 1;
+              if (promptCount === 1) {
+                // Establish baseline usage first
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: { sessionUpdate: "usage_update", used: 8000, size: 200000 },
+                });
+                // 7 lightweight tool calls (must all pass — no 5-call cap!)
+                for (let i = 1; i <= 7; i++) {
+                  const perm = await ctx.client.request(acp.methods.client.session.requestPermission, {
+                    sessionId: ctx.params.sessionId,
+                    toolCall: {
+                      toolCallId: `tc-${i}`,
+                      title: `git status #${i}`,
+                      kind: "execute",
+                      rawInput: { command: "git status" },
+                    },
+                    options: [
+                      { optionId: "allow", name: "Allow", kind: "allow_once" },
+                      { optionId: "reject", name: "Reject", kind: "reject_once" },
+                    ],
+                  });
+                  permissionOutcomes.push(
+                    perm.outcome.outcome === "selected" ? perm.outcome.optionId : "cancelled"
+                  );
+                }
+                // Now push net tokens over the configured 5000 limit (+6000 over baseline)
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: { sessionUpdate: "usage_update", used: 14500, size: 200000 },
+                });
+                // 8th tool call must now be rejected due to net token watermark!
+                const perm8 = await ctx.client.request(acp.methods.client.session.requestPermission, {
+                  sessionId: ctx.params.sessionId,
+                  toolCall: {
+                    toolCallId: "tc-8",
+                    title: "git status #8",
+                    kind: "execute",
+                    rawInput: { command: "git status" },
+                  },
+                  options: [
+                    { optionId: "allow", name: "Allow", kind: "allow_once" },
+                    { optionId: "reject", name: "Reject", kind: "reject_once" },
+                  ],
+                });
+                permissionOutcomes.push(
+                  perm8.outcome.outcome === "selected" ? perm8.outcome.optionId : "cancelled"
+                );
+                return { stopReason: "end_turn" };
+              }
+              // Phase 2 compaction prompt
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify({
+                      status: "COMPLETED",
+                      deliverableSummary: "compacted after token limit",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    })}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const task = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        permissionMode: "bypassPermissions",
+        draft: true,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        const unsub = engine.subscribe((ev) => {
+          if (ev.type === "pulse_finished" && ev.taskId === task.id) {
+            unsub();
+            setTimeout(resolve, 20);
+          }
+        });
+      });
+      engine.sendUserMessage(task.id, { text: "测试纯 Token 净增控制" });
+      await done;
+
+      assert.deepEqual(permissionOutcomes, [
+        "allow",
+        "allow",
+        "allow",
+        "allow",
+        "allow",
+        "allow",
+        "allow",
+        "reject",
+      ]);
+      // Phase 2 compaction prompt must have run after budget exhaustion!
+      assert.equal(promptCount, 2);
+      const pulses = store.listPulses(task.id, false);
+      assert.equal(pulses[0].netTokenLimit, 5000);
+      assert.equal(pulses[0].maxActions, 0);
+      assert.equal(pulses[0].actionCount, 7);
     } finally {
       store.close();
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });

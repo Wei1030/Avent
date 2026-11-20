@@ -23,11 +23,19 @@ import type {
   TranscriptItem,
 } from "../shared/types.js";
 
-export function getBudgetForMode(mode: PulseMode): { maxActions: number; netTokenLimit: number } {
+export function getBudgetForMode(
+  mode: PulseMode,
+  configuredNetTokenLimit = 14000
+): { maxActions: number; netTokenLimit: number } {
+  const limit =
+    Number.isFinite(configuredNetTokenLimit) && configuredNetTokenLimit > 0
+      ? Math.round(configuredNetTokenLimit)
+      : 14000;
   if (mode === "sac") {
-    return { maxActions: 1, netTokenLimit: 8000 };
+    return { maxActions: 1, netTokenLimit: Math.min(8000, limit) };
   }
-  return { maxActions: 5, netTokenLimit: 14000 };
+  // Pure EoCC (token-delta driven): maxActions = 0 means no artificial tool-call count cap
+  return { maxActions: 0, netTokenLimit: limit };
 }
 
 interface PendingApprovalEntry {
@@ -455,7 +463,8 @@ export class PulseEngine {
       const task = this.store.getTask(taskId);
       if (!task) return;
 
-      const budget = getBudgetForMode(task.pulseMode);
+      const prefs = this.store.getPreferences();
+      const budget = getBudgetForMode(task.pulseMode, prefs.contextNetTokenLimit);
       const pulse = this.store.createPulse({
         taskId,
         providerId: task.providerId,
@@ -969,7 +978,11 @@ ${event.payload}
 </current_request>
 
 <execution_guidelines>
-1. **Bounded Actions & Selective Reading**: Take at most **${budget.maxActions}** external tool call(s) in this round. Prefer \`avent_doc_grep\` and \`avent_doc_read\` for large files, and \`avent_history_grep\` if you ever need raw logs from an earlier round.
+1. **Selective Reading & Clean Context**: ${
+    budget.maxActions > 0
+      ? `Take at most **${budget.maxActions}** external tool call(s) in this round.`
+      : `This round is bounded by net context growth (~${budget.netTokenLimit.toLocaleString()} tokens) with no fixed tool-call count limit.`
+  } Prefer \`avent_doc_grep\` and \`avent_doc_read\` for large files, and \`avent_history_grep\` if you ever need raw logs from an earlier round.
 2. **Respect Excluded Dead-Ends**: Do NOT repeat approaches listed in \`deadEnds\`. Separate verified facts (\`establishedFacts\` with exact \`path#Lstart-Lend\` pointers) from unverified \`openHypotheses\`.
 3. **Natural User Communication**: Write clear, natural responses in the user's language. NEVER mention internal implementation jargon such as "pulse", "micro-session", "SSSM", or "watermark" to the user.
 4. **Task Title, Objective & Durable Directives (Automatic State Maintenance)**:
@@ -982,7 +995,7 @@ ${event.payload}
    - Write your helpful response for the user, and before ending your turn call \`avent_commit_state\` (from the \`avent\` MCP server):
      - \`status = "COMPLETED"\` when the user's concrete task/request is satisfied and any code edits are verified.
      - \`status = "WAITING_HUMAN"\` when you answered a greeting/question and await follow-up, or need user clarification.
-     - \`status = "CONTINUE"\` when autonomous steps remain beyond this ${budget.maxActions}-action round; fill \`remainingPlan\` and \`immediateNextAction\`.
+     - \`status = "CONTINUE"\` when more autonomous steps remain beyond this round; fill \`remainingPlan\` and \`immediateNextAction\`.
    - Once \`avent_commit_state\` succeeds, stop calling tools and end your turn immediately.
 </execution_guidelines>`;
 }

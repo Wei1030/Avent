@@ -70,8 +70,34 @@ export function SettingsPage() {
   );
 }
 
+const CONTEXT_LIMIT_PRESETS: Array<{ value: number; title: string; desc: string }> = [
+  { value: 14000, title: "14K · 默认", desc: "论文 24K 甜点区，最省额度" },
+  { value: 24000, title: "24K · 平衡", desc: "论文 32K 宽窗，更少切轮" },
+  { value: 36000, title: "36K · 宽窗", desc: "长链路任务减少交接次数" },
+  { value: 64000, title: "64K · 宽松", desc: "大上下文场景，切轮频率最低" },
+];
+
 function GeneralSettings() {
   const { prefs, providers, endpoints, updatePrefs, toast, t } = useApp();
+  const currentLimit = prefs.contextNetTokenLimit || 14000;
+  const [customLimitInput, setCustomLimitInput] = useState(String(currentLimit));
+
+  useEffect(() => {
+    setCustomLimitInput(String(currentLimit));
+  }, [currentLimit]);
+
+  const parsedCustomLimit = Math.round(Number(customLimitInput.replace(/,/g, "").trim()));
+  const customLimitValid =
+    Number.isFinite(parsedCustomLimit) &&
+    parsedCustomLimit >= 4000 &&
+    parsedCustomLimit <= 200000;
+  const customLimitDirty = customLimitValid && parsedCustomLimit !== currentLimit;
+
+  const applyContextLimit = async (nextVal: number) => {
+    const clamped = Math.max(4000, Math.min(200000, Math.round(nextVal)));
+    await updatePrefs({ contextNetTokenLimit: clamped });
+    toast(`已将单轮上下文净增上限设为 ${clamped.toLocaleString()} tokens`, "good");
+  };
 
   // Compute effective default model & thought levels
   const effectiveModelId = useMemo(() => {
@@ -170,6 +196,72 @@ function GeneralSettings() {
                 toast("已更新默认权限模式", "good");
               }}
             />
+          </div>
+        </div>
+      </div>
+
+      {/* Context Window Control (EoCC pure token-delta handoff) */}
+      <div className="panel" style={{ marginTop: 16 }}>
+        <div className="panel-head">
+          <h3>上下文控制（短窗接力）</h3>
+          <span className="sub">不限制单轮工具调用次数，仅按上下文净增 Token 水位自动交接切轮</span>
+        </div>
+        <div className="panel-body col" style={{ gap: 14 }}>
+          <div className="ctx-preset-grid">
+            {CONTEXT_LIMIT_PRESETS.map((p) => (
+              <button
+                key={p.value}
+                type="button"
+                className={cx("ctx-preset-card", currentLimit === p.value && "on")}
+                onClick={() => void applyContextLimit(p.value)}
+              >
+                <b>{p.title}</b>
+                <span className="d">{p.desc}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="row" style={{ justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+            <div>
+              <b>单轮上下文净增上限</b>
+              <div className="hint">可输入 4,000 ~ 200,000 之间的任意数值（默认 14,000）</div>
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <input
+                type="number"
+                className="input sm mono"
+                style={{ width: 132, textAlign: "right" }}
+                min={4000}
+                max={200000}
+                step={1000}
+                value={customLimitInput}
+                onChange={(e) => setCustomLimitInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (isPlainEnter(e) && customLimitDirty) {
+                    void applyContextLimit(parsedCustomLimit);
+                  }
+                }}
+              />
+              <span className="muted" style={{ fontSize: 12 }}>tokens</span>
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={!customLimitDirty}
+                onClick={() => void applyContextLimit(parsedCustomLimit)}
+              >
+                应用
+              </Button>
+            </div>
+          </div>
+
+          <div className="hint" style={{ lineHeight: 1.55 }}>
+            每轮执行净增达到 <b className="mono">{currentLimit.toLocaleString()}</b> tokens
+            时，Avent 会自动保存结构化「状态记忆」、清空底层会话并开新会话续跑。计入底层 CLI 约 6K–10K
+            固定系统提示词后，当前单轮总窗口约{" "}
+            <b className="mono">
+              {Math.round((currentLimit + 6000) / 1000)}K–{Math.round((currentLimit + 10000) / 1000)}K
+            </b>{" "}
+            tokens。
           </div>
         </div>
       </div>

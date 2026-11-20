@@ -2235,4 +2235,83 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
     }
   });
+
+  it("reconciles orphaned PULSING tasks & streaming items on startup and via cancelTaskPulse fallback", () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-reconcile-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    const store = new AventStore(dbDir, tmpDir);
+    try {
+      const task1 = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        permissionMode: "bypassPermissions",
+        draft: false,
+      });
+      store.updateTaskStatus(task1.id, "PULSING");
+      store.createPulse({
+        taskId: task1.id,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        maxActions: 0,
+        netTokenLimit: 14000,
+      });
+      store.upsertTaskItem(task1.id, {
+        id: "stuck-think-1",
+        kind: "thinking",
+        text: "thinking before crash...",
+        seconds: 12,
+        streaming: true,
+        createdAt: new Date().toISOString(),
+      });
+
+      const task2 = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        permissionMode: "bypassPermissions",
+        draft: false,
+      });
+      store.updateTaskStatus(task2.id, "PULSING");
+      store.upsertTaskItem(task2.id, {
+        id: "stuck-tool-2",
+        kind: "tool",
+        toolCallId: "tc-stuck",
+        tool: "Bash",
+        detail: "echo hi",
+        status: "running",
+        createdAt: new Date().toISOString(),
+      });
+
+      // Test manual cancelTaskPulse fallback on task2 (no active in-memory runner)
+      const registry = new ProviderRegistry(process.cwd(), store);
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+      });
+      assert.equal(engine.cancelTaskPulse(task2.id), true);
+      assert.equal(store.getTask(task2.id)?.status, "WAITING_HUMAN");
+      const items2 = store.listTaskItems(task2.id);
+      const t2 = items2.find((i) => i.id === "stuck-tool-2");
+      assert.equal(t2?.kind === "tool" ? t2.status : null, "error");
+
+      // Test startup reconciliation on remaining zombie task1
+      const reconciledCount = store.reconcileInterruptedTasksOnStartup();
+      assert.equal(reconciledCount, 1);
+      assert.equal(store.getTask(task1.id)?.status, "WAITING_HUMAN");
+      const pulses1 = store.listPulses(task1.id, false);
+      assert.equal(pulses1[0].status, "CANCELLED");
+      const items1 = store.listTaskItems(task1.id);
+      const th1 = items1.find((i) => i.id === "stuck-think-1");
+      assert.equal(th1?.kind === "thinking" ? th1.streaming : null, false);
+      assert.ok(items1.some((i) => i.kind === "notice"));
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
 });

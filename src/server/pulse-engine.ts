@@ -192,9 +192,21 @@ export class PulseEngine {
     }
     this.queuedByTask.delete(taskId);
     const active = this.activeByTask.get(taskId);
-    if (!active) return false;
-    active.abortController.abort();
-    return true;
+    if (active) {
+      active.abortController.abort();
+      return true;
+    }
+    // Reconcile orphaned PULSING / WAITING_APPROVAL task when no live runner exists in memory
+    const rec = this.store.reconcileInterruptedTask(taskId, "已停止当前执行轮次。");
+    if (rec.reconciled && rec.task) {
+      for (const item of rec.updatedItems) {
+        this.broadcast({ type: "item_upserted", taskId, item });
+      }
+      this.broadcast({ type: "task_updated", task: this.decorateTask(rec.task)! });
+      this.broadcast({ type: "workspace_updated", workspaces: this.store.listWorkspaces() });
+      return true;
+    }
+    return false;
   }
 
   public addNotice(taskId: string, tone: "good" | "info" | "warn", text: string): void {

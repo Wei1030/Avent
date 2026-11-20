@@ -1502,6 +1502,133 @@ export class AventStore {
     return rows.map((r) => JSON.parse(r.state_json) as SemanticState);
   }
 
+  /**
+   * Reconciles a single zombie PULSING / WAITING_APPROVAL task (or lingering streaming/running items
+   * and RUNNING pulses) after a server restart or manual stop when no in-memory runner is active.
+   */
+  public reconcileInterruptedTask(
+    taskId: string,
+    noticeText?: string
+  ): { task: TaskRecord | null; updatedItems: TranscriptItem[]; reconciled: boolean } {
+    const task = this.getTask(taskId);
+    if (!task) return { task: null, updatedItems: [], reconciled: false };
+
+    const now = new Date().toISOString();
+    let reconciled = false;
+    const updatedItems: TranscriptItem[] = [];
+
+    const runningPulses = this.db
+      .prepare(`SELECT id FROM pulses WHERE task_id = ? AND status = 'RUNNING'`)
+      .all(taskId) as Array<{ id: string }>;
+    if (runningPulses.length > 0) {
+      this.db
+        .prepare(
+          `UPDATE pulses
+           SET status = 'CANCELLED', session_closed = 1, ended_at = COALESCE(ended_at, ?)
+           WHERE task_id = ? AND status = 'RUNNING'`
+        )
+        .run(now, taskId);
+      reconciled = true;
+    }
+
+    const stuckRows = this.db
+      .prepare(
+        `SELECT id, item_json FROM task_items
+         WHERE task_id = ?
+           AND (
+             item_json LIKE '%"streaming":true%'
+             OR item_json LIKE '%"status":"running"%'
+             OR item_json LIKE '%"status":"waiting"%'
+           )
+         ORDER BY seq ASC`
+      )
+      .all(taskId) as Array<{ id: string; item_json: string }>;
+
+    for (const row of stuckRows) {
+      try {
+        const parsed = JSON.parse(row.item_json) as TranscriptItem;
+        let changed = false;
+        if (parsed.kind === "thinking" && parsed.streaming) {
+          parsed.streaming = false;
+          changed = true;
+        } else if (parsed.kind === "text" && parsed.streaming) {
+          parsed.streaming = false;
+          parsed.aborted = true;
+          changed = true;
+        } else if (
+          parsed.kind === "tool" &&
+          (parsed.status === "running" || parsed.status === "waiting")
+        ) {
+          parsed.status = "error";
+          changed = true;
+        }
+        if (changed) {
+          this.db
+            .prepare(`UPDATE task_items SET item_json = ? WHERE id = ?`)
+            .run(JSON.stringify(parsed), row.id);
+          updatedItems.push(parsed);
+          reconciled = true;
+        }
+      } catch {
+        // ignore malformed json
+      }
+    }
+
+    if (task.status === "PULSING" || task.status === "WAITING_APPROVAL") {
+      this.db
+        .prepare(`UPDATE tasks SET status = 'WAITING_HUMAN', updated_at = ? WHERE id = ?`)
+        .run(now, taskId);
+      reconciled = true;
+    }
+
+    if (reconciled && noticeText) {
+      const notice: TranscriptItem = {
+        id: crypto.randomUUID(),
+        kind: "notice",
+        tone: "info",
+        text: noticeText,
+        createdAt: now,
+      };
+      this.upsertTaskItem(taskId, notice);
+      updatedItems.push(notice);
+    }
+
+    return {
+      task: this.getTask(taskId),
+      updatedItems,
+      reconciled,
+    };
+  }
+
+  /**
+   * Called once on server startup: resets any tasks/pulses/streaming blocks orphaned in
+   * PULSING / WAITING_APPROVAL / RUNNING state from a prior process shutdown.
+   */
+  public reconcileInterruptedTasksOnStartup(): number {
+    const rows = this.db
+      .prepare(
+        `SELECT id AS task_id FROM tasks WHERE status IN ('PULSING', 'WAITING_APPROVAL')
+         UNION
+         SELECT DISTINCT task_id FROM pulses WHERE status = 'RUNNING'
+         UNION
+         SELECT DISTINCT task_id FROM task_items
+         WHERE item_json LIKE '%"streaming":true%'
+            OR item_json LIKE '%"status":"running"%'
+            OR item_json LIKE '%"status":"waiting"%'`
+      )
+      .all() as Array<{ task_id: string }>;
+
+    let count = 0;
+    for (const r of rows) {
+      const res = this.reconcileInterruptedTask(
+        r.task_id,
+        "上一执行轮次因服务重启已中断，你可以随时继续对话。"
+      );
+      if (res.reconciled) count += 1;
+    }
+    return count;
+  }
+
   public deleteTask(taskId: string): void {
     this.db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
   }

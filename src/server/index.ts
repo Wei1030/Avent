@@ -69,6 +69,7 @@ export function createAventApp(options?: {
   const port = options?.port ?? Number(process.env.AVENT_PORT || 4320);
 
   const store = new AventStore(dataDir, root);
+  store.reconcileInterruptedTasksOnStartup();
   const registry = new ProviderRegistry(root, store);
   const engine = new PulseEngine({
     store,

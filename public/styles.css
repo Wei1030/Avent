@@ -688,6 +688,25 @@ a:hover { text-decoration: underline; }
 .perm-tester-result.ask { border-color: var(--warn-line); background: #fffdf5; }
 .perm-tester-result.deny { border-color: var(--crit-line); background: #fff7f7; }
 
+/* Worktree Settings (Repo vs Local File Config) */
+.wt-scope-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.wt-scope-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  padding: 11px 13px; border-radius: 9px; border: 1px solid var(--border);
+  background: var(--surface); cursor: pointer; text-align: left;
+  transition: border-color .12s, background .12s;
+}
+.wt-scope-card:hover { border-color: var(--accent); background: var(--surface-2); }
+.wt-scope-card.on { background: var(--accent-soft); border: 1.5px solid var(--accent); }
+.wt-scope-card b { font-size: 13.5px; color: var(--ink); }
+.wt-scope-card .d { font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.wt-git-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.wt-field-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+
 /* File Preview Modal */
 .file-view { font-family: var(--mono); font-size: 12px; line-height: 1.65; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); overflow: auto; max-height: 62vh; padding: 6px 0; }
 .file-view .fl { display: flex; min-width: max-content; }

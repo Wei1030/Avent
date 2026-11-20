@@ -20,6 +20,8 @@ import type {
   TaskRef,
   UsageReport,
   WorkspaceRecord,
+  WorkspaceWorktreeConfig,
+  WorktreeConfigScope,
   WorktreeLiveStatus,
   WorktreeMergeResult,
 } from "../../shared/types.js";
@@ -76,6 +78,42 @@ export const api = {
     req<{ ok: boolean; workspaces: WorkspaceRecord[] }>(`/api/workspaces/${id}`, {
       method: "DELETE",
     }),
+
+  getWorktreeConfig: (workspaceId: string) =>
+    req<{ config: WorkspaceWorktreeConfig }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/worktree-config`
+    ),
+  saveWorktreeConfig: (
+    workspaceId: string,
+    body: {
+      scope: WorktreeConfigScope;
+      setupCommand: string;
+      initPrompt: string;
+      forceTrackRepo?: boolean;
+    }
+  ) =>
+    req<{
+      config: WorkspaceWorktreeConfig;
+      forceTracked: boolean;
+      workspaces: WorkspaceRecord[];
+    }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/worktree-config`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  worktreeConfigGitAction: (
+    workspaceId: string,
+    body: {
+      scope: WorktreeConfigScope;
+      action: "track" | "force_track" | "untrack" | "ensure_exclude";
+    }
+  ) =>
+    req<{ config: WorkspaceWorktreeConfig; workspaces: WorkspaceRecord[] }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/worktree-config/git`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      }
+    ),
 
   browseFs: (path = "") =>
     req<{

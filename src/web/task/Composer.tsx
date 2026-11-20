@@ -254,9 +254,9 @@ export function Composer({
               ? "独立工作树基于当前分支 HEAD 拉出，不包含主目录未提交改动。"
               : `发送首条消息时将从 ${wsObj?.branch || "当前分支"} 拉出独立工作树并行运行。`}
           </span>
-          {(wsObj?.worktreeSetupCommand || wsObj?.worktreeInitPrompt) && (
-            <Chip tone="accent">已配初始化</Chip>
-          )}
+          {(wsObj?.hasWorktreeInitConfig ||
+            wsObj?.worktreeSetupCommand ||
+            wsObj?.worktreeInitPrompt) && <Chip tone="accent">已配初始化</Chip>}
           <button
             type="button"
             className="link-btn"

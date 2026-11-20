@@ -15,9 +15,13 @@ import {
   abortWorktreeRebase,
   createTaskWorktree,
   defaultWorktreesRoot,
+  getEffectiveWorktreeConfigSync,
   getTaskWorktreeStatus,
   mergeTaskWorktree,
+  readWorkspaceWorktreeConfig,
   removeTaskWorktree,
+  runWorktreeConfigGitAction,
+  saveWorkspaceWorktreeConfig,
   validateWorktreeRoot,
 } from "./worktrees.js";
 import { boundedDocRead, searchPulseHistory, surgicalGrep } from "./selective-io.js";
@@ -32,6 +36,7 @@ import {
   type PulseMode,
   type TaskProviderId,
   type TaskRef,
+  type WorktreeConfigScope,
 } from "../shared/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -163,6 +168,86 @@ export function createAventApp(options?: {
     const workspaces = store.listWorkspaces();
     engine.broadcast({ type: "workspace_updated", workspaces });
     return c.json({ workspace: ws, workspaces });
+  });
+
+  app.get("/api/workspaces/:id/worktree-config", async (c) => {
+    const id = c.req.param("id");
+    const ws = store.getWorkspace(id);
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    const config = await readWorkspaceWorktreeConfig({
+      workspaceId: ws.id,
+      workspacePath: ws.path,
+      worktreeRoot: ws.worktreeRoot || "",
+    });
+    return c.json({ config });
+  });
+
+  app.put("/api/workspaces/:id/worktree-config", async (c) => {
+    const id = c.req.param("id");
+    const ws = store.getWorkspace(id);
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    const body = await c.req.json<{
+      scope: WorktreeConfigScope;
+      setupCommand?: string;
+      initPrompt?: string;
+      forceTrackRepo?: boolean;
+    }>();
+    if (body.scope !== "repo" && body.scope !== "local") {
+      return c.json({ error: "无效的配置范围（仅支持 repo 或 local）" }, 400);
+    }
+    try {
+      const { config, forceTracked } = await saveWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: ws.path,
+        worktreeRoot: ws.worktreeRoot || "",
+        scope: body.scope,
+        setupCommand: typeof body.setupCommand === "string" ? body.setupCommand : "",
+        initPrompt: typeof body.initPrompt === "string" ? body.initPrompt : "",
+        forceTrackRepo: Boolean(body.forceTrackRepo),
+      });
+      // Once saved to project files, clear any deprecated DB columns so files remain the single source of truth
+      store.clearLegacyWorktreeDbConfig(ws.id);
+      store.invalidateGitCache(ws.path);
+      const workspaces = store.listWorkspaces();
+      engine.broadcast({ type: "workspace_updated", workspaces });
+      return c.json({ config, forceTracked, workspaces });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        400
+      );
+    }
+  });
+
+  app.post("/api/workspaces/:id/worktree-config/git", async (c) => {
+    const id = c.req.param("id");
+    const ws = store.getWorkspace(id);
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    const body = await c.req.json<{
+      scope: WorktreeConfigScope;
+      action: "track" | "force_track" | "untrack" | "ensure_exclude";
+    }>();
+    if (body.scope !== "repo" && body.scope !== "local") {
+      return c.json({ error: "无效的配置范围" }, 400);
+    }
+    try {
+      const config = await runWorktreeConfigGitAction({
+        workspaceId: ws.id,
+        workspacePath: ws.path,
+        worktreeRoot: ws.worktreeRoot || "",
+        scope: body.scope,
+        action: body.action,
+      });
+      store.invalidateGitCache(ws.path);
+      const workspaces = store.listWorkspaces();
+      engine.broadcast({ type: "workspace_updated", workspaces });
+      return c.json({ config, workspaces });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        400
+      );
+    }
   });
 
   app.delete("/api/workspaces/:id", (c) => {
@@ -417,15 +502,28 @@ export function createAventApp(options?: {
         let setupWarn = false;
         if (createdWt.setupResult) {
           const sec = (createdWt.setupResult.durationMs / 1000).toFixed(1);
+          const scopeLabel =
+            createdWt.setupResult.ranScopes.length === 2
+              ? "仓库+本地初始化脚本"
+              : createdWt.setupResult.ranScopes[0] === "repo"
+                ? "仓库初始化脚本"
+                : createdWt.setupResult.ranScopes[0] === "local"
+                  ? "本地初始化脚本"
+                  : "初始化脚本";
           if (createdWt.setupResult.ok) {
-            setupNote = `；初始化命令执行成功（${sec}s）`;
+            setupNote = `；${scopeLabel}执行成功（${sec}s）`;
           } else {
             setupWarn = true;
             const tail = createdWt.setupResult.output.slice(-260);
-            setupNote = `；初始化命令失败（退出码 ${createdWt.setupResult.exitCode ?? "timeout"}，${sec}s）${tail ? `：${tail}` : ""}`;
+            setupNote = `；${scopeLabel}失败（退出码 ${createdWt.setupResult.exitCode ?? "timeout"}，${sec}s）${tail ? `：${tail}` : ""}`;
           }
         }
-        if (ws.worktreeInitPrompt?.trim()) {
+        const wtCfg = getEffectiveWorktreeConfigSync(
+          ws.path,
+          { setupCommand: ws.worktreeSetupCommand, initPrompt: ws.worktreeInitPrompt },
+          createdWt.cwd
+        );
+        if (wtCfg.combinedInitPrompt) {
           setupNote += "；已附带工作区初始化提示词";
         }
         wtMeta = {

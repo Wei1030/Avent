@@ -1,17 +1,32 @@
 import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
   WorkspaceRecord,
+  WorkspaceWorktreeConfig,
+  WorktreeConfigScope,
   WorktreeLiveStatus,
   WorktreeMergeResult,
+  WorktreeRepoGitState,
 } from "../shared/types.js";
 import { isPathInsideRoot, resolveCanonicalPath } from "./shell-parser.js";
 
 const execFileAsync = promisify(execFile);
+
+export const WORKTREE_REPO_CONFIG_REL = ".avent/worktree.json";
+export const WORKTREE_LOCAL_CONFIG_REL = ".avent/worktree.local.json";
+const WORKTREE_LOCAL_EXCLUDE_PATTERN = "**/.avent/worktree.local.json";
 
 const GIT_ENV_BASE: NodeJS.ProcessEnv = {
   ...process.env,
@@ -172,6 +187,7 @@ async function findFreeWorktreeSlot(
 
 export interface SetupCommandResult {
   ran: boolean;
+  ranScopes: WorktreeConfigScope[];
   command: string;
   ok: boolean;
   exitCode: number | null;
@@ -179,20 +195,460 @@ export interface SetupCommandResult {
   output: string;
 }
 
-function runSetupCommand(
-  command: string,
+// =========================================================================
+// Project-Directory Worktree Config Files (Repo vs Local) & Git Controls
+// =========================================================================
+
+interface RawWorktreeFileData {
+  exists: boolean;
+  setupCommand: string;
+  initPrompt: string;
+}
+
+function normalizeScriptText(raw: string): string {
+  return raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function readWorktreeConfigFileSync(filePath: string): RawWorktreeFileData {
+  if (!existsSync(filePath)) {
+    return { exists: false, setupCommand: "", initPrompt: "" };
+  }
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as { setupCommand?: unknown; initPrompt?: unknown };
+    return {
+      exists: true,
+      setupCommand: typeof parsed.setupCommand === "string" ? normalizeScriptText(parsed.setupCommand) : "",
+      initPrompt: typeof parsed.initPrompt === "string" ? normalizeScriptText(parsed.initPrompt) : "",
+    };
+  } catch {
+    return { exists: true, setupCommand: "", initPrompt: "" };
+  }
+}
+
+export function getEffectiveWorktreeConfigSync(
+  wsPath: string,
+  legacyFallback?: { setupCommand?: string; initPrompt?: string },
+  secondaryRepoDir?: string
+): {
+  repoSetupCommand: string;
+  localSetupCommand: string;
+  repoInitPrompt: string;
+  localInitPrompt: string;
+  combinedInitPrompt: string;
+  hasAny: boolean;
+} {
+  let repo = readWorktreeConfigFileSync(path.join(wsPath, WORKTREE_REPO_CONFIG_REL));
+  if (!repo.exists && secondaryRepoDir && path.resolve(secondaryRepoDir) !== path.resolve(wsPath)) {
+    repo = readWorktreeConfigFileSync(path.join(secondaryRepoDir, WORKTREE_REPO_CONFIG_REL));
+  }
+  const local = readWorktreeConfigFileSync(path.join(wsPath, WORKTREE_LOCAL_CONFIG_REL));
+
+  let repoSetup = repo.setupCommand.trim();
+  let localSetup = local.setupCommand.trim();
+  let repoPrompt = repo.initPrompt.trim();
+  let localPrompt = local.initPrompt.trim();
+
+  // Graceful fallback to legacy DB columns only when neither project file exists
+  if (!repo.exists && !local.exists && legacyFallback) {
+    if (legacyFallback.setupCommand?.trim()) {
+      localSetup = normalizeScriptText(legacyFallback.setupCommand).trim();
+    }
+    if (legacyFallback.initPrompt?.trim()) {
+      localPrompt = normalizeScriptText(legacyFallback.initPrompt).trim();
+    }
+  }
+
+  const combinedInitPrompt = [repoPrompt, localPrompt].filter(Boolean).join("\n\n");
+  return {
+    repoSetupCommand: repoSetup,
+    localSetupCommand: localSetup,
+    repoInitPrompt: repoPrompt,
+    localInitPrompt: localPrompt,
+    combinedInitPrompt,
+    hasAny: Boolean(repoSetup || localSetup || combinedInitPrompt),
+  };
+}
+
+export function hasWorkspaceWorktreeInitConfigSync(
+  wsPath: string,
+  legacyFallback?: { setupCommand?: string; initPrompt?: string }
+): boolean {
+  return getEffectiveWorktreeConfigSync(wsPath, legacyFallback).hasAny;
+}
+
+async function isGitRepoDir(wsPath: string): Promise<boolean> {
+  if (!wsPath || !existsSync(wsPath)) return false;
+  try {
+    const out = await git(wsPath, "rev-parse", "--is-inside-work-tree");
+    return out.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+async function resolveGitExcludePath(wsPath: string): Promise<string | null> {
+  try {
+    const relOrAbs = await git(wsPath, "rev-parse", "--git-path", "info/exclude");
+    if (!relOrAbs) return null;
+    return path.isAbsolute(relOrAbs) ? relOrAbs : path.resolve(wsPath, relOrAbs);
+  } catch {
+    return null;
+  }
+}
+
+async function isFileTrackedInGit(wsPath: string, relPath: string): Promise<boolean> {
+  try {
+    await git(wsPath, "ls-files", "--error-unmatch", relPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isPathIgnoredByGit(wsPath: string, relPath: string): Promise<boolean> {
+  try {
+    await git(wsPath, "check-ignore", "--no-index", "-q", relPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isLocalConfigExcludedInGit(wsPath: string): Promise<boolean> {
+  const excludePath = await resolveGitExcludePath(wsPath);
+  if (!excludePath || !existsSync(excludePath)) return false;
+  try {
+    const content = readFileSync(excludePath, "utf8");
+    const lines = content.split(/\r?\n/).map((l) => l.trim());
+    return (
+      lines.includes(WORKTREE_LOCAL_EXCLUDE_PATTERN) ||
+      lines.includes(WORKTREE_LOCAL_CONFIG_REL) ||
+      lines.includes(`/${WORKTREE_LOCAL_CONFIG_REL}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function ensureLocalWorktreeConfigExcluded(wsPath: string): Promise<boolean> {
+  const excludePath = await resolveGitExcludePath(wsPath);
+  if (!excludePath) return false;
+  mkdirSync(path.dirname(excludePath), { recursive: true });
+  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+  const lines = existing.split(/\r?\n/).map((l) => l.trim());
+  if (
+    lines.includes(WORKTREE_LOCAL_EXCLUDE_PATTERN) ||
+    lines.includes(WORKTREE_LOCAL_CONFIG_REL)
+  ) {
+    return true;
+  }
+  const prefix = existing.length === 0 || existing.endsWith("\n") ? existing : `${existing}\n`;
+  writeFileSync(
+    excludePath,
+    `${prefix}# Avent local worktree config (machine-local, never committed)\n${WORKTREE_LOCAL_EXCLUDE_PATTERN}\n`,
+    "utf8"
+  );
+  return true;
+}
+
+export async function readWorkspaceWorktreeConfig(params: {
+  workspaceId: string;
+  workspacePath: string;
+  worktreeRoot?: string;
+}): Promise<WorkspaceWorktreeConfig> {
+  const { workspaceId, workspacePath, worktreeRoot = "" } = params;
+  const repoAbs = path.join(workspacePath, WORKTREE_REPO_CONFIG_REL);
+  const localAbs = path.join(workspacePath, WORKTREE_LOCAL_CONFIG_REL);
+  const repoFile = readWorktreeConfigFileSync(repoAbs);
+  const localFile = readWorktreeConfigFileSync(localAbs);
+  const isGitRepo = await isGitRepoDir(workspacePath);
+
+  let repoGitState: WorktreeRepoGitState = "no_git";
+  let wouldBeIgnored = false;
+  let excludedInGit = false;
+  let localTrackedInGit = false;
+
+  if (isGitRepo) {
+    const [repoTracked, repoIgnored, localExcluded, localTracked] = await Promise.all([
+      isFileTrackedInGit(workspacePath, WORKTREE_REPO_CONFIG_REL),
+      isPathIgnoredByGit(workspacePath, WORKTREE_REPO_CONFIG_REL),
+      isLocalConfigExcludedInGit(workspacePath),
+      isFileTrackedInGit(workspacePath, WORKTREE_LOCAL_CONFIG_REL),
+    ]);
+    wouldBeIgnored = repoIgnored;
+    excludedInGit = localExcluded;
+    localTrackedInGit = localTracked;
+
+    if (!repoFile.exists) {
+      repoGitState = "absent";
+    } else if (repoTracked) {
+      repoGitState = "tracked";
+    } else if (repoIgnored) {
+      repoGitState = "ignored";
+    } else {
+      repoGitState = "untracked";
+    }
+  }
+
+  return {
+    workspaceId,
+    isGitRepo,
+    worktreeRoot,
+    repo: {
+      relPath: WORKTREE_REPO_CONFIG_REL,
+      absPath: repoAbs,
+      exists: repoFile.exists,
+      gitState: repoGitState,
+      wouldBeIgnored,
+      setupCommand: repoFile.setupCommand,
+      initPrompt: repoFile.initPrompt,
+    },
+    local: {
+      relPath: WORKTREE_LOCAL_CONFIG_REL,
+      absPath: localAbs,
+      exists: localFile.exists,
+      excludedInGit,
+      trackedInGit: localTrackedInGit,
+      setupCommand: localFile.setupCommand,
+      initPrompt: localFile.initPrompt,
+    },
+  };
+}
+
+function tryCleanupEmptyAventDir(wsPath: string): void {
+  const dir = path.join(wsPath, ".avent");
+  if (!existsSync(dir)) return;
+  try {
+    if (readdirSync(dir).length === 0) {
+      rmdirSync(dir);
+    }
+  } catch {
+    // ignore if non-empty or locked
+  }
+}
+
+export async function saveWorkspaceWorktreeConfig(params: {
+  workspaceId: string;
+  workspacePath: string;
+  worktreeRoot?: string;
+  scope: WorktreeConfigScope;
+  setupCommand: string;
+  initPrompt: string;
+  forceTrackRepo?: boolean;
+}): Promise<{ config: WorkspaceWorktreeConfig; forceTracked: boolean }> {
+  const { workspaceId, workspacePath, worktreeRoot, scope, forceTrackRepo } = params;
+  const setupCommand = normalizeScriptText(params.setupCommand).trim();
+  const initPrompt = normalizeScriptText(params.initPrompt).trim();
+
+  const relPath = scope === "repo" ? WORKTREE_REPO_CONFIG_REL : WORKTREE_LOCAL_CONFIG_REL;
+  const absPath = path.join(workspacePath, relPath);
+  let forceTracked = false;
+
+  if (!setupCommand && !initPrompt) {
+    if (existsSync(absPath)) {
+      rmSync(absPath, { force: true });
+    }
+    tryCleanupEmptyAventDir(workspacePath);
+  } else {
+    mkdirSync(path.dirname(absPath), { recursive: true });
+    const payload = {
+      setupCommand,
+      initPrompt,
+    };
+    writeFileSync(absPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+
+    if (scope === "local") {
+      await ensureLocalWorktreeConfigExcluded(workspacePath).catch(() => {});
+    } else if (scope === "repo" && forceTrackRepo) {
+      if (await isGitRepoDir(workspacePath)) {
+        const alreadyTracked = await isFileTrackedInGit(workspacePath, WORKTREE_REPO_CONFIG_REL);
+        const ignored = await isPathIgnoredByGit(workspacePath, WORKTREE_REPO_CONFIG_REL);
+        if (!alreadyTracked && ignored) {
+          await git(workspacePath, "add", "-f", WORKTREE_REPO_CONFIG_REL);
+          forceTracked = true;
+        }
+      }
+    }
+  }
+
+  const config = await readWorkspaceWorktreeConfig({
+    workspaceId,
+    workspacePath,
+    worktreeRoot,
+  });
+  return { config, forceTracked };
+}
+
+export async function runWorktreeConfigGitAction(params: {
+  workspaceId: string;
+  workspacePath: string;
+  worktreeRoot?: string;
+  scope: WorktreeConfigScope;
+  action: "track" | "force_track" | "untrack" | "ensure_exclude";
+}): Promise<WorkspaceWorktreeConfig> {
+  const { workspaceId, workspacePath, worktreeRoot, scope, action } = params;
+  if (!(await isGitRepoDir(workspacePath))) {
+    throw new Error("当前工作区不是 Git 仓库，无法执行 Git 追踪操作。");
+  }
+
+  const relPath = scope === "repo" ? WORKTREE_REPO_CONFIG_REL : WORKTREE_LOCAL_CONFIG_REL;
+  const absPath = path.join(workspacePath, relPath);
+
+  if (action === "ensure_exclude") {
+    await ensureLocalWorktreeConfigExcluded(workspacePath);
+  } else if (action === "track") {
+    if (!existsSync(absPath)) {
+      throw new Error(`文件 ${relPath} 尚未创建，请先保存配置。`);
+    }
+    await git(workspacePath, "add", relPath);
+  } else if (action === "force_track") {
+    if (scope !== "repo") {
+      throw new Error("仅仓库共享配置文件允许强制加入 Git 追踪。");
+    }
+    if (!existsSync(absPath)) {
+      throw new Error(`文件 ${relPath} 尚未创建，请先保存配置。`);
+    }
+    await git(workspacePath, "add", "-f", relPath);
+  } else if (action === "untrack") {
+    await git(workspacePath, "rm", "--cached", "--ignore-unmatch", relPath);
+    if (scope === "local") {
+      await ensureLocalWorktreeConfigExcluded(workspacePath);
+    }
+  }
+
+  return readWorkspaceWorktreeConfig({ workspaceId, workspacePath, worktreeRoot });
+}
+
+// =========================================================================
+// Multi-Line Setup Script Execution (Windows .cmd / PowerShell + Unix sh)
+// =========================================================================
+
+type ScriptShellKind = "cmd" | "powershell" | "sh" | "bash";
+
+function detectSetupScriptShell(script: string): { kind: ScriptShellKind; body: string } {
+  const normalized = normalizeScriptText(script).trim();
+  const lines = normalized.split("\n");
+  const first = lines[0]?.trim() || "";
+
+  if (/^#!\s*(?:\/(?:usr\/)?bin\/(?:env\s+)?)?(pwsh|powershell)\b/i.test(first)) {
+    return { kind: "powershell", body: lines.slice(1).join("\n").trim() };
+  }
+  if (/^#!\s*(cmd|bat)\b/i.test(first)) {
+    return { kind: "cmd", body: lines.slice(1).join("\n").trim() };
+  }
+  if (/^#!\s*(?:\/(?:usr\/)?bin\/(?:env\s+)?)?bash\b/i.test(first)) {
+    return { kind: "bash", body: lines.slice(1).join("\n").trim() };
+  }
+  if (/^#!\s*(?:\/(?:usr\/)?bin\/(?:env\s+)?)?(?:sh|zsh)\b/i.test(first)) {
+    return { kind: "sh", body: lines.slice(1).join("\n").trim() };
+  }
+
+  if (process.platform === "win32") {
+    const looksLikePowerShell =
+      /(^|\s)(\$env:|\$PSScriptRoot|\$[a-zA-Z_]\w*\s*=|\b(?:Copy-Item|New-Item|Test-Path|Write-Host|Write-Output|Set-Location|Join-Path|Get-Item|Get-Content|Set-Content|Remove-Item|Start-Process|ForEach-Object|Where-Object)\b)/im.test(
+        normalized
+      );
+    return { kind: looksLikePowerShell ? "powershell" : "cmd", body: normalized };
+  }
+
+  return { kind: "sh", body: normalized };
+}
+
+function buildWindowsCmdScript(body: string): string {
+  const lines = body.split("\n");
+  const hasBatchFlow = /^\s*(?:if|for|else|goto)\b|^\s*:|\(\s*$|^\s*\)/im.test(body);
+  const hasEchoHeader = /^\s*@?echo\b/im.test(lines[0] || "");
+  const out: string[] = [];
+  if (!hasEchoHeader) {
+    out.push("@echo off");
+    out.push("chcp 65001 >nul");
+  }
+
+  const batchWrapperRe = /^(\s*)((?:npm|npx|pnpm|yarn|corepack)(?:\.cmd)?)(?=\s|$)/i;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    // Allow `# comment` lines cleanly even inside Windows cmd scripts
+    if (trimmed.startsWith("#")) {
+      out.push(`rem ${trimmed.slice(1).trim()}`);
+      continue;
+    }
+    const isComment = /^rem(?:\s|$)|^::/i.test(trimmed);
+    const transformed =
+      !isComment && !/^\s*call\s+/i.test(rawLine)
+        ? rawLine.replace(batchWrapperRe, "$1call $2")
+        : rawLine;
+    out.push(transformed);
+    if (!hasBatchFlow && !isComment && !/^\s*@?echo\s+(off|on)\s*$/i.test(trimmed)) {
+      out.push("if errorlevel 1 exit /b %errorlevel%");
+    }
+  }
+
+  return `${out.join("\r\n")}\r\n`;
+}
+
+function runSetupScript(
+  script: string,
   cwd: string,
   envExtra: Record<string, string>,
   timeoutMs = 180_000
-): Promise<SetupCommandResult> {
+): Promise<Omit<SetupCommandResult, "ranScopes">> {
   const started = Date.now();
+  const { kind, body } = detectSetupScriptShell(script);
+  if (!body) {
+    return Promise.resolve({
+      ran: false,
+      command: script,
+      ok: true,
+      exitCode: 0,
+      durationMs: 0,
+      output: "",
+    });
+  }
+
+  const tmpId = `avent-wt-setup-${crypto.randomUUID().slice(0, 10)}`;
+  let tmpFile = "";
+  let exe = "";
+  let args: string[] = [];
+
+  if (kind === "powershell") {
+    tmpFile = path.join(os.tmpdir(), `${tmpId}.ps1`);
+    // UTF-8 BOM ensures Windows PowerShell 5.1 reads non-ASCII characters cleanly
+    const psBody =
+      `\uFEFF$ErrorActionPreference = 'Stop'\r\n` +
+      `${body.replace(/\n/g, "\r\n")}\r\n` +
+      `if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\n`;
+    writeFileSync(tmpFile, psBody, "utf8");
+    exe = process.platform === "win32" ? "powershell.exe" : "pwsh";
+    args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmpFile];
+  } else if (kind === "cmd") {
+    tmpFile = path.join(os.tmpdir(), `${tmpId}.cmd`);
+    writeFileSync(tmpFile, buildWindowsCmdScript(body), "utf8");
+    exe = process.env.ComSpec || "cmd.exe";
+    args = ["/d", "/c", tmpFile];
+  } else {
+    tmpFile = path.join(os.tmpdir(), `${tmpId}.sh`);
+    writeFileSync(tmpFile, `set -e\n${body}\n`, "utf8");
+    exe = kind === "bash" ? "bash" : "sh";
+    args = [tmpFile];
+  }
+
+  const cleanupTmp = () => {
+    try {
+      if (tmpFile && existsSync(tmpFile)) rmSync(tmpFile, { force: true });
+    } catch {
+      // ignore
+    }
+  };
+
   return new Promise((resolve) => {
     let output = "";
     let settled = false;
 
-    const child = spawn(command, [], {
+    const child = spawn(exe, args, {
       cwd,
-      shell: true,
       windowsHide: true,
       env: {
         ...process.env,
@@ -218,13 +674,14 @@ function runSetupCommand(
       } catch {
         // ignore
       }
+      cleanupTmp();
       resolve({
         ran: true,
-        command,
+        command: script,
         ok: false,
         exitCode: null,
         durationMs: Date.now() - started,
-        output: `${output}\n[初始化命令执行超时 (${Math.round(timeoutMs / 1000)}s)]`.trim(),
+        output: `${output}\n[初始化脚本执行超时 (${Math.round(timeoutMs / 1000)}s)]`.trim(),
       });
     }, timeoutMs);
 
@@ -232,9 +689,10 @@ function runSetupCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanupTmp();
       resolve({
         ran: true,
-        command,
+        command: script,
         ok: false,
         exitCode: 1,
         durationMs: Date.now() - started,
@@ -246,9 +704,10 @@ function runSetupCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanupTmp();
       resolve({
         ran: true,
-        command,
+        command: script,
         ok: code === 0,
         exitCode: code,
         durationMs: Date.now() - started,
@@ -314,16 +773,67 @@ export async function createTaskWorktree(params: {
   const cwd = subPrefix ? path.join(wtRoot, subPrefix) : wtRoot;
   mkdirSync(cwd, { recursive: true });
 
+  const effectiveCfg = getEffectiveWorktreeConfigSync(
+    workspace.path,
+    {
+      setupCommand: workspace.worktreeSetupCommand,
+      initPrompt: workspace.worktreeInitPrompt,
+    },
+    cwd
+  );
+
+  const steps: Array<{ scope: WorktreeConfigScope; label: string; script: string }> = [];
+  if (effectiveCfg.repoSetupCommand) {
+    steps.push({ scope: "repo", label: "仓库初始化脚本", script: effectiveCfg.repoSetupCommand });
+  }
+  if (effectiveCfg.localSetupCommand) {
+    steps.push({ scope: "local", label: "本地初始化脚本", script: effectiveCfg.localSetupCommand });
+  }
+
   let setupResult: SetupCommandResult | undefined;
-  const setupCmd = workspace.worktreeSetupCommand?.trim();
-  if (setupCmd) {
-    setupResult = await runSetupCommand(setupCmd, cwd, {
+  if (steps.length > 0) {
+    const envExtra = {
       AVENT_MAIN_WORKSPACE: workspace.path,
       AVENT_WORKTREE_PATH: wtRoot,
       AVENT_WORKTREE_CWD: cwd,
       AVENT_WORKTREE_BRANCH: branch,
       AVENT_WORKTREE_BASE_BRANCH: baseBranch,
-    });
+    };
+    const ranScopes: WorktreeConfigScope[] = [];
+    const outputs: string[] = [];
+    let totalDurationMs = 0;
+    let ok = true;
+    let exitCode: number | null = 0;
+
+    for (const step of steps) {
+      const r = await runSetupScript(step.script, cwd, envExtra);
+      if (!r.ran) continue;
+      ranScopes.push(step.scope);
+      totalDurationMs += r.durationMs;
+      if (r.output) {
+        outputs.push(steps.length > 1 ? `[${step.label}]\n${r.output}` : r.output);
+      }
+      if (!r.ok) {
+        ok = false;
+        exitCode = r.exitCode;
+        if (steps.length > 1 && !r.output) {
+          outputs.push(`[${step.label}] 执行失败`);
+        }
+        break;
+      }
+    }
+
+    if (ranScopes.length > 0) {
+      setupResult = {
+        ran: true,
+        ranScopes,
+        command: steps.map((s) => s.script).join("\n"),
+        ok,
+        exitCode,
+        durationMs: totalDurationMs,
+        output: outputs.join("\n\n").trim(),
+      };
+    }
   }
 
   return {

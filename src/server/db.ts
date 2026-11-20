@@ -12,6 +12,7 @@ import {
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { hasWorkspaceWorktreeInitConfigSync } from "./worktrees.js";
 import type {
   AppPreferences,
   AventEvent,
@@ -553,6 +554,14 @@ export class AventStore {
     return this.getWorkspace(id);
   }
 
+  public clearLegacyWorktreeDbConfig(id: string): void {
+    this.db
+      .prepare(
+        `UPDATE workspaces SET worktree_setup_command = '', worktree_init_prompt = '' WHERE id = ?`
+      )
+      .run(id);
+  }
+
   public invalidateGitCache(wsPath?: string): void {
     if (wsPath) this.gitCache.delete(wsPath);
     else this.gitCache.clear();
@@ -624,6 +633,12 @@ export class AventStore {
       )
       .get(id) as { total: number; running: number | null };
     const git = this.getGitMeta(wsPath);
+    const legacySetup = r.worktree_setup_command ? String(r.worktree_setup_command) : undefined;
+    const legacyPrompt = r.worktree_init_prompt ? String(r.worktree_init_prompt) : undefined;
+    const hasWorktreeInitConfig = hasWorkspaceWorktreeInitConfigSync(wsPath, {
+      setupCommand: legacySetup,
+      initPrompt: legacyPrompt,
+    });
     return {
       id,
       name: String(r.name),
@@ -633,10 +648,9 @@ export class AventStore {
       branch: git.branch,
       gitClean: git.clean,
       worktreeRoot: r.worktree_root ? String(r.worktree_root) : undefined,
-      worktreeSetupCommand: r.worktree_setup_command
-        ? String(r.worktree_setup_command)
-        : undefined,
-      worktreeInitPrompt: r.worktree_init_prompt ? String(r.worktree_init_prompt) : undefined,
+      hasWorktreeInitConfig,
+      worktreeSetupCommand: legacySetup,
+      worktreeInitPrompt: legacyPrompt,
       taskCount: Number(stats.total || 0),
       runningCount: Number(stats.running || 0),
       createdAt: String(r.created_at),

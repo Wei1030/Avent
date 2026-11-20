@@ -5,6 +5,7 @@ import type { AventStore } from "./db.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { executeAcpPulse, stripAventStateTag } from "./providers/acp-driver.js";
 import { describeToolCall, evaluateToolPermission } from "./permissions.js";
+import { getEffectiveWorktreeConfigSync } from "./worktrees.js";
 import type {
   ApprovalDecisionPayload,
   ApprovalRequest,
@@ -268,20 +269,30 @@ export class PulseEngine {
   ): string {
     const sections: string[] = [];
 
-    // On first turn of a Worktree-isolated task, prepend workspace-configured worktree init prompt if present
+    // On first turn of a Worktree-isolated task, prepend project-file worktree init prompt (Repo + Local) if present
     if (isFirstTurn && task.worktreePath && !task.worktreeRemoved && task.workspaceId) {
       const ws = this.store.getWorkspace(task.workspaceId);
-      const initPrompt = ws?.worktreeInitPrompt?.trim();
-      if (initPrompt) {
-        sections.push(
-          [
-            `<worktree_init_instructions branch="${task.worktreeBranch || ""}" base="${task.worktreeBaseBranch || ""}">`,
-            "当前任务运行在全新创建的独立 Git 工作树目录中（你的当前工作目录即该工作树）。",
-            "在正式执行用户请求之前，请先按照下方工作区初始化提示词准备环境：",
-            initPrompt,
-            "</worktree_init_instructions>",
-          ].join("\n")
+      if (ws) {
+        const wtCfg = getEffectiveWorktreeConfigSync(
+          ws.path,
+          {
+            setupCommand: ws.worktreeSetupCommand,
+            initPrompt: ws.worktreeInitPrompt,
+          },
+          task.cwd
         );
+        const initPrompt = wtCfg.combinedInitPrompt;
+        if (initPrompt) {
+          sections.push(
+            [
+              `<worktree_init_instructions branch="${task.worktreeBranch || ""}" base="${task.worktreeBaseBranch || ""}">`,
+              "当前任务运行在全新创建的独立 Git 工作树目录中（你的当前工作目录即该工作树）。",
+              "在正式执行用户请求之前，请先按照下方工作区初始化提示词准备环境：",
+              initPrompt,
+              "</worktree_init_instructions>",
+            ].join("\n")
+          );
+        }
       }
     }
 

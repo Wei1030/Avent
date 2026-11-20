@@ -10,6 +10,8 @@ import type {
   PermissionMode,
   PermissionRuleRecord,
   ProviderId,
+  WorkspaceWorktreeConfig,
+  WorktreeConfigScope,
 } from "../../shared/types.js";
 import { api } from "../api/client.js";
 import { useApp } from "../store/app-context.js";
@@ -609,50 +611,204 @@ function PermissionsSettings() {
   );
 }
 
+const WORKTREE_INIT_PROMPT_EXAMPLE =
+  "Windows 用目录联接 mklink /J，其他系统用符号链接 ln -s 把主目录的 node_modules 联接到工作树里。";
+
+const WORKTREE_SETUP_PLACEHOLDER = [
+  "# 支持多行脚本（Windows 默认 cmd，检测到 $env: / Copy-Item 或 #!pwsh 时走 PowerShell；macOS/Linux 走 sh）",
+  'if exist "%AVENT_MAIN_WORKSPACE%\\.env" copy "%AVENT_MAIN_WORKSPACE%\\.env" .env',
+  "npm.cmd ci --prefer-offline",
+].join("\n");
+
 function WorktreeSettings() {
   const { activeWorkspace, setWorkspaces, defaultWorktreesRoot, toast } = useApp();
-  const [setupCommand, setSetupCommand] = useState("");
-  const [initPrompt, setInitPrompt] = useState("");
+  const [scope, setScope] = useState<WorktreeConfigScope>("repo");
+  const [config, setConfig] = useState<WorkspaceWorktreeConfig | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Per-scope editor state so switching between Repo and Local tabs preserves unsaved edits
+  const [drafts, setDrafts] = useState<
+    Record<WorktreeConfigScope, { setupCommand: string; initPrompt: string }>
+  >({
+    repo: { setupCommand: "", initPrompt: "" },
+    local: { setupCommand: "", initPrompt: "" },
+  });
+  const [forceTrackOnSave, setForceTrackOnSave] = useState(true);
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [gitBusy, setGitBusy] = useState(false);
+
+  // Machine-local worktree root (saved in local DB)
   const [wtRoot, setWtRoot] = useState("");
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [rootDirty, setRootDirty] = useState(false);
+  const [savingRoot, setSavingRoot] = useState(false);
+
+  const syncFromConfig = (cfg: WorkspaceWorktreeConfig, syncScope?: WorktreeConfigScope) => {
+    setConfig(cfg);
+    setDrafts((prev) => ({
+      repo:
+        !syncScope || syncScope === "repo"
+          ? { setupCommand: cfg.repo.setupCommand, initPrompt: cfg.repo.initPrompt }
+          : prev.repo,
+      local:
+        !syncScope || syncScope === "local"
+          ? { setupCommand: cfg.local.setupCommand, initPrompt: cfg.local.initPrompt }
+          : prev.local,
+    }));
+  };
 
   useEffect(() => {
-    setSetupCommand(activeWorkspace?.worktreeSetupCommand ?? "");
-    setInitPrompt(activeWorkspace?.worktreeInitPrompt ?? "");
     setWtRoot(activeWorkspace?.worktreeRoot ?? "");
-    setDirty(false);
-  }, [
-    activeWorkspace?.id,
-    activeWorkspace?.worktreeSetupCommand,
-    activeWorkspace?.worktreeInitPrompt,
-    activeWorkspace?.worktreeRoot,
-  ]);
+    setRootDirty(false);
+    if (!activeWorkspace) {
+      setConfig(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    void api
+      .getWorktreeConfig(activeWorkspace.id)
+      .then((res) => {
+        if (!cancelled) syncFromConfig(res.config);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(err instanceof Error ? err.message : String(err), "crit");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace?.id]);
 
-  const handleSave = async () => {
+  useEffect(() => {
+    setWtRoot(activeWorkspace?.worktreeRoot ?? "");
+    setRootDirty(false);
+  }, [activeWorkspace?.worktreeRoot]);
+
+  const activeDraft = drafts[scope];
+  const savedScope = config ? config[scope] : null;
+  const repoDirty = Boolean(
+    config &&
+      (drafts.repo.setupCommand !== config.repo.setupCommand ||
+        drafts.repo.initPrompt !== config.repo.initPrompt)
+  );
+  const localDirty = Boolean(
+    config &&
+      (drafts.local.setupCommand !== config.local.setupCommand ||
+        drafts.local.initPrompt !== config.local.initPrompt)
+  );
+  const activeDirty = scope === "repo" ? repoDirty : localDirty;
+
+  const updateActiveDraft = (patch: Partial<{ setupCommand: string; initPrompt: string }>) => {
+    setDrafts((prev) => ({
+      ...prev,
+      [scope]: { ...prev[scope], ...patch },
+    }));
+  };
+
+  const handleSaveConfig = async () => {
     if (!activeWorkspace) return;
-    setSaving(true);
+    setSavingConfig(true);
     try {
-      const res = await api.updateWorkspace(activeWorkspace.id, {
-        worktreeSetupCommand: setupCommand.trim(),
-        worktreeInitPrompt: initPrompt.trim(),
-        worktreeRoot: wtRoot.trim(),
+      const res = await api.saveWorktreeConfig(activeWorkspace.id, {
+        scope,
+        setupCommand: activeDraft.setupCommand,
+        initPrompt: activeDraft.initPrompt,
+        forceTrackRepo: scope === "repo" ? forceTrackOnSave : false,
       });
       setWorkspaces(res.workspaces);
-      setDirty(false);
-      toast("已保存工作树配置", "good");
+      syncFromConfig(res.config, scope);
+      const isEmpty = !activeDraft.setupCommand.trim() && !activeDraft.initPrompt.trim();
+      if (isEmpty) {
+        toast(
+          scope === "repo" ? "已清空并移除仓库工作树配置文件" : "已清空并移除本地工作树配置文件",
+          "good"
+        );
+      } else if (scope === "repo") {
+        toast(
+          res.forceTracked
+            ? "已保存 .avent/worktree.json 并强制加入 Git 追踪（git add -f）"
+            : "已保存仓库工作树配置到 .avent/worktree.json",
+          "good"
+        );
+      } else {
+        toast(
+          res.config.local.excludedInGit
+            ? "已保存本地配置到 .avent/worktree.local.json（已写入 .git/info/exclude 强制忽略）"
+            : "已保存本地工作树配置到 .avent/worktree.local.json",
+          "good"
+        );
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     } finally {
-      setSaving(false);
+      setSavingConfig(false);
     }
   };
+
+  const handleGitAction = async (
+    action: "track" | "force_track" | "untrack" | "ensure_exclude"
+  ) => {
+    if (!activeWorkspace) return;
+    setGitBusy(true);
+    try {
+      const res = await api.worktreeConfigGitAction(activeWorkspace.id, { scope, action });
+      setWorkspaces(res.workspaces);
+      setConfig(res.config);
+      const msgMap: Record<typeof action, string> = {
+        track: "已执行 git add，文件已加入暂存区",
+        force_track: "已执行 git add -f，强制纳入 Git 追踪（后续改动将自动被 Git 识别）",
+        untrack:
+          scope === "local"
+            ? "已移出 Git 追踪并写入 .git/info/exclude 强制忽略"
+            : "已从 Git 索引移出追踪（本地文件已保留）",
+        ensure_exclude: "已写入 .git/info/exclude 强制忽略本地配置文件",
+      };
+      toast(msgMap[action], "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setGitBusy(false);
+    }
+  };
+
+  const handleSaveRoot = async () => {
+    if (!activeWorkspace) return;
+    setSavingRoot(true);
+    try {
+      const res = await api.updateWorkspace(activeWorkspace.id, {
+        worktreeRoot: wtRoot.trim(),
+      });
+      setWorkspaces(res.workspaces);
+      setRootDirty(false);
+      toast("已保存本机工作树存放目录", "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setSavingRoot(false);
+    }
+  };
+
+  const repoHasContent = Boolean(
+    config && (config.repo.setupCommand.trim() || config.repo.initPrompt.trim())
+  );
+  const localHasContent = Boolean(
+    config && (config.local.setupCommand.trim() || config.local.initPrompt.trim())
+  );
+  const showForceTrackCheckbox = Boolean(
+    scope === "repo" &&
+      config?.isGitRepo &&
+      config.repo.wouldBeIgnored &&
+      config.repo.gitState !== "tracked" &&
+      (activeDraft.setupCommand.trim() || activeDraft.initPrompt.trim())
+  );
 
   return (
     <>
       <h1>并行工作树（Git Worktree）</h1>
       <p className="lead">
-        同一工作区内多任务并行开发时，可在新建任务输入框底部切换为「独立工作树」。此处配置当前工作区的初始化命令、首个提示词与存放路径。
+        同一工作区内多任务并行开发时，可在新建任务输入框底部切换为「独立工作树」。初始化脚本与提示词直接保存在项目目录文件中，分为「仓库共享」与「本地私有」两层，拉出工作树时按「仓库 → 本地」顺序依次生效。
       </p>
 
       {!activeWorkspace ? (
@@ -660,96 +816,338 @@ function WorktreeSettings() {
           <div className="empty">请先添加一个项目工作区后再配置工作树选项。</div>
         </div>
       ) : (
-        <div className="panel">
-          <div className="panel-head">
-            <Icon name="folder" size={16} className="accent" />
-            <h3>{activeWorkspace.name}</h3>
-            <span className="mono muted truncate" style={{ fontSize: 12 }}>
-              {activeWorkspace.path}
-            </span>
-            <span className="grow" />
-            {activeWorkspace.isGitRepo ? (
-              <Chip mono icon="branch" tone="accent">
-                {activeWorkspace.branch || "Git 仓库"}
-              </Chip>
-            ) : (
-              <Status tone="warn">非 Git 仓库</Status>
-            )}
+        <div className="col" style={{ gap: 16 }}>
+          {/* Panel 1: Project-Directory Config Files (Repo vs Local) */}
+          <div className="panel">
+            <div className="panel-head">
+              <Icon name="folder" size={16} className="accent" />
+              <h3>{activeWorkspace.name}</h3>
+              <span className="mono muted truncate" style={{ fontSize: 12 }}>
+                {activeWorkspace.path}
+              </span>
+              <span className="grow" />
+              {activeWorkspace.isGitRepo ? (
+                <Chip mono icon="branch" tone="accent">
+                  {activeWorkspace.branch || "Git 仓库"}
+                </Chip>
+              ) : (
+                <Status tone="warn">非 Git 仓库</Status>
+              )}
+            </div>
+
+            <div className="panel-body col" style={{ gap: 14 }}>
+              {!activeWorkspace.isGitRepo && (
+                <div className="notice warn">
+                  <Icon name="warning" size={15} />
+                  <span>当前工作区目录不是 Git 仓库，无法开启独立工作树隔离。</span>
+                </div>
+              )}
+
+              {/* Repo vs Local Scope Selector */}
+              <div className="wt-scope-grid">
+                <button
+                  type="button"
+                  className={cx("wt-scope-card", scope === "repo" && "on")}
+                  onClick={() => setScope("repo")}
+                >
+                  <div className="row" style={{ gap: 6, width: "100%" }}>
+                    <Icon name="branch" size={14} className={scope === "repo" ? "accent" : "muted"} />
+                    <b>仓库共享</b>
+                    {repoHasContent && <Chip tone="good">已配置</Chip>}
+                    {repoDirty && <Chip tone="warn">未保存</Chip>}
+                    <span className="grow" />
+                    <code className="mono muted" style={{ fontSize: 11 }}>
+                      .avent/worktree.json
+                    </code>
+                  </div>
+                  <div className="d">
+                    随代码库提交与团队共享；若被 <code className="mono">.gitignore</code> 忽略，支持一键{" "}
+                    <code className="mono">git add -f</code> 强制追踪。
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className={cx("wt-scope-card", scope === "local" && "on")}
+                  onClick={() => setScope("local")}
+                >
+                  <div className="row" style={{ gap: 6, width: "100%" }}>
+                    <Icon name="lock" size={14} className={scope === "local" ? "accent" : "muted"} />
+                    <b>本地私有</b>
+                    {localHasContent && <Chip tone="accent">已配置</Chip>}
+                    {localDirty && <Chip tone="warn">未保存</Chip>}
+                    <span className="grow" />
+                    <code className="mono muted" style={{ fontSize: 11 }}>
+                      .avent/worktree.local.json
+                    </code>
+                  </div>
+                  <div className="d">
+                    仅在本机生效（如本机路径、私密脚本）；自动写入{" "}
+                    <code className="mono">.git/info/exclude</code> 强制忽略，不修改{" "}
+                    <code className="mono">.gitignore</code>。
+                  </div>
+                </button>
+              </div>
+
+              {/* Git Tracking / Ignore Control Bar */}
+              {config?.isGitRepo && (
+                <div className="wt-git-bar">
+                  {scope === "repo" ? (
+                    <>
+                      {config.repo.gitState === "tracked" && (
+                        <>
+                          <Status tone="good">已纳入 Git 追踪</Status>
+                          <span className="hint grow">
+                            Git 将持续追踪 <code className="mono">{config.repo.relPath}</code>{" "}
+                            的改动（即使 <code className="mono">.gitignore</code> 忽略了{" "}
+                            <code className="mono">.avent/</code>）。
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            busy={gitBusy}
+                            onClick={() => void handleGitAction("untrack")}
+                          >
+                            移出 Git 追踪
+                          </Button>
+                        </>
+                      )}
+                      {config.repo.gitState === "ignored" && (
+                        <>
+                          <Status tone="warn">当前被 .gitignore 忽略</Status>
+                          <span className="hint grow">
+                            项目 <code className="mono">.gitignore</code> 忽略了此路径，点击右侧按钮可执行{" "}
+                            <code className="mono">git add -f</code> 强制纳入仓库追踪。
+                          </span>
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            busy={gitBusy}
+                            onClick={() => void handleGitAction("force_track")}
+                          >
+                            强制加入 Git 追踪
+                          </Button>
+                        </>
+                      )}
+                      {config.repo.gitState === "untracked" && (
+                        <>
+                          <Status tone="info">Git 可见（待提交）</Status>
+                          <span className="hint grow">
+                            文件已写入项目目录，可直接随代码提交到仓库。
+                          </span>
+                          <Button
+                            size="sm"
+                            busy={gitBusy}
+                            onClick={() => void handleGitAction("track")}
+                          >
+                            暂存到 Git (git add)
+                          </Button>
+                        </>
+                      )}
+                      {config.repo.gitState === "absent" && (
+                        <>
+                          <Status tone={config.repo.wouldBeIgnored ? "warn" : "idle"}>
+                            {config.repo.wouldBeIgnored
+                              ? "尚未创建 · 路径被 .gitignore 忽略"
+                              : "尚未创建"}
+                          </Status>
+                          <span className="hint grow">
+                            {config.repo.wouldBeIgnored
+                              ? "当前仓库 .gitignore 忽略了 .avent/；保存时勾选下方选项即可自动执行 git add -f 强制纳入仓库追踪。"
+                              : `填写下方内容并保存，将在项目根目录生成 ${config.repo.relPath}。`}
+                          </span>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {config.local.trackedInGit ? (
+                        <>
+                          <Status tone="warn">意外处于 Git 追踪中</Status>
+                          <span className="hint grow">
+                            本地私有文件不应纳入版本库，建议移出索引并写入{" "}
+                            <code className="mono">.git/info/exclude</code>。
+                          </span>
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            busy={gitBusy}
+                            onClick={() => void handleGitAction("untrack")}
+                          >
+                            移出追踪并强制忽略
+                          </Button>
+                        </>
+                      ) : config.local.excludedInGit ? (
+                        <>
+                          <Status tone="good">已强制忽略 (.git/info/exclude)</Status>
+                          <span className="hint grow">
+                            已自动写入本地 <code className="mono">.git/info/exclude</code>，不会修改项目{" "}
+                            <code className="mono">.gitignore</code>，也不污染{" "}
+                            <code className="mono">git status</code>。
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Status tone="info">保存时自动强制忽略</Status>
+                          <span className="hint grow">
+                            保存本地配置时，将自动把{" "}
+                            <code className="mono">**/.avent/worktree.local.json</code> 写入{" "}
+                            <code className="mono">.git/info/exclude</code>（不改动{" "}
+                            <code className="mono">.gitignore</code>）。
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            busy={gitBusy}
+                            onClick={() => void handleGitAction("ensure_exclude")}
+                          >
+                            立即写入忽略规则
+                          </Button>
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {loading && !config ? (
+                <div className="loading-block" style={{ padding: "24px 0" }}>
+                  <span className="spinner" />
+                  <span>正在读取项目工作树配置文件…</span>
+                </div>
+              ) : (
+                <>
+                  <div className="field">
+                    <div className="wt-field-head">
+                      <label style={{ margin: 0 }}>自定义初始化脚本（支持多行，可选）</label>
+                      <span className="hint">
+                        保存至 <code className="mono">{savedScope?.relPath ?? (scope === "repo" ? ".avent/worktree.json" : ".avent/worktree.local.json")}</code>
+                      </span>
+                    </div>
+                    <textarea
+                      className="editor"
+                      style={{ minHeight: 124 }}
+                      spellCheck={false}
+                      placeholder={WORKTREE_SETUP_PLACEHOLDER}
+                      value={activeDraft.setupCommand}
+                      onChange={(e) => updateActiveDraft({ setupCommand: e.target.value })}
+                    />
+                    <div className="hint">
+                      每次拉出新工作树后、智能体启动前自动在该工作树目录执行（仓库与本地均有配置时，先执行仓库脚本再执行本地脚本）。可用环境变量：
+                      <code className="mono">AVENT_MAIN_WORKSPACE</code>（主工作区路径）、
+                      <code className="mono">AVENT_WORKTREE_PATH</code>、
+                      <code className="mono">AVENT_WORKTREE_BRANCH</code>。
+                    </div>
+                  </div>
+
+                  <div className="field">
+                    <div className="wt-field-head">
+                      <label style={{ margin: 0 }}>附带初始化提示词（可选）</label>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon="spark"
+                        onClick={() => updateActiveDraft({ initPrompt: WORKTREE_INIT_PROMPT_EXAMPLE })}
+                      >
+                        填入示例
+                      </Button>
+                    </div>
+                    <textarea
+                      className="textarea"
+                      style={{ minHeight: 96 }}
+                      placeholder={WORKTREE_INIT_PROMPT_EXAMPLE}
+                      value={activeDraft.initPrompt}
+                      onChange={(e) => updateActiveDraft({ initPrompt: e.target.value })}
+                    />
+                    <div className="hint">
+                      开启「独立工作树」创建任务时，此段内容会自动附带在发给模型的首个输入中，让模型按你的要求完成环境准备（仓库与本地提示词将自动合并生效）。
+                    </div>
+                  </div>
+
+                  <div
+                    className="row"
+                    style={{
+                      justifyContent: "space-between",
+                      flexWrap: "wrap",
+                      gap: 10,
+                      paddingTop: 4,
+                    }}
+                  >
+                    <div>
+                      {showForceTrackCheckbox && (
+                        <label
+                          className="row"
+                          style={{ gap: 6, fontSize: 12.5, color: "var(--ink-2)", cursor: "pointer" }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={forceTrackOnSave}
+                            onChange={(e) => setForceTrackOnSave(e.target.checked)}
+                          />
+                          <span>
+                            保存时自动执行 <code className="mono">git add -f</code> 强制加入仓库追踪
+                          </span>
+                        </label>
+                      )}
+                    </div>
+                    <div className="row" style={{ gap: 8 }}>
+                      {(activeDraft.setupCommand.trim() || activeDraft.initPrompt.trim()) && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => updateActiveDraft({ setupCommand: "", initPrompt: "" })}
+                        >
+                          清空内容
+                        </Button>
+                      )}
+                      <Button
+                        variant="primary"
+                        busy={savingConfig}
+                        disabled={!activeDirty}
+                        onClick={() => void handleSaveConfig()}
+                      >
+                        {scope === "repo" ? "保存仓库配置" : "保存本地配置"}
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
 
-          <div className="panel-body col" style={{ gap: 16 }}>
-            {!activeWorkspace.isGitRepo && (
-              <div className="notice warn">
-                <Icon name="warning" size={15} />
-                <span>当前工作区目录不是 Git 仓库，无法开启独立工作树隔离。</span>
-              </div>
-            )}
-
-            <div className="field">
-              <label>自定义初始化命令（可选）</label>
-              <input
-                className="input mono"
-                placeholder='例如：npm.cmd ci --prefer-offline 或 copy "%AVENT_MAIN_WORKSPACE%\.env" .env'
-                value={setupCommand}
-                onChange={(e) => {
-                  setSetupCommand(e.target.value);
-                  setDirty(true);
-                }}
-              />
-              <div className="hint">
-                每次拉出新工作树后、智能体启动前自动在该工作树目录执行。可用环境变量：
-                <code className="mono">AVENT_MAIN_WORKSPACE</code>（主工作区路径）、
-                <code className="mono">AVENT_WORKTREE_PATH</code>、
-                <code className="mono">AVENT_WORKTREE_BRANCH</code>。
-              </div>
+          {/* Panel 2: Machine-Local Worktree Storage Root */}
+          <div className="panel">
+            <div className="panel-head">
+              <h3>本机存放根目录</h3>
+              <span className="sub">与当前电脑磁盘路径相关，仅保存在本机，不写入项目目录</span>
             </div>
-
-            <div className="field">
-              <label>附带初始化提示词（可选）</label>
-              <textarea
-                className="textarea"
-                style={{ minHeight: 100 }}
-                placeholder="例如：这是刚拉出的独立工作树。请先检查依赖和本地 .env 配置是否齐备，如需初始化请先完成准备，再开始处理我的主要需求。"
-                value={initPrompt}
-                onChange={(e) => {
-                  setInitPrompt(e.target.value);
-                  setDirty(true);
-                }}
-              />
-              <div className="hint">
-                开启「独立工作树」创建任务时，此段内容会自动附带在发给模型的首个输入中，让模型按你的要求自行完成环境初始化。
+            <div className="panel-body col" style={{ gap: 8 }}>
+              <div className="row" style={{ gap: 8 }}>
+                <input
+                  className="input mono grow"
+                  placeholder={
+                    defaultWorktreesRoot
+                      ? `留空默认：${defaultWorktreesRoot}`
+                      : "留空使用系统用户目录下的 .avent/worktrees"
+                  }
+                  value={wtRoot}
+                  onChange={(e) => {
+                    setWtRoot(e.target.value);
+                    setRootDirty(true);
+                  }}
+                />
+                <Button
+                  variant="primary"
+                  busy={savingRoot}
+                  disabled={!rootDirty}
+                  onClick={() => void handleSaveRoot()}
+                >
+                  保存路径
+                </Button>
               </div>
-            </div>
-
-            <div className="field">
-              <label>工作树存放根目录（可选）</label>
-              <input
-                className="input mono"
-                placeholder={
-                  defaultWorktreesRoot
-                    ? `留空默认：${defaultWorktreesRoot}`
-                    : "留空使用系统用户目录下的 .avent/worktrees"
-                }
-                value={wtRoot}
-                onChange={(e) => {
-                  setWtRoot(e.target.value);
-                  setDirty(true);
-                }}
-              />
               <div className="hint">
                 必须为位于所有 Git 仓库外部的完整绝对路径，防止主仓库扫描到嵌套副本。
               </div>
-            </div>
-
-            <div className="row" style={{ justifyContent: "flex-end" }}>
-              <Button
-                variant="primary"
-                busy={saving}
-                disabled={!dirty}
-                onClick={() => void handleSave()}
-              >
-                保存工作树配置
-              </Button>
             </div>
           </div>
         </div>

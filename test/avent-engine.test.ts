@@ -14,7 +14,10 @@ import {
   createTaskWorktree,
   getTaskWorktreeStatus,
   mergeTaskWorktree,
+  readWorkspaceWorktreeConfig,
   removeTaskWorktree,
+  runWorktreeConfigGitAction,
+  saveWorkspaceWorktreeConfig,
   validateWorktreeRoot,
 } from "../src/server/worktrees.js";
 import {
@@ -1202,6 +1205,256 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       assert.equal(rem2.removedDir, true);
       assert.equal(rem2.deletedBranch, true);
       assert.equal(existsSync(wt2.worktreePath), false);
+    } finally {
+      store.close();
+      rmSync(tmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
+
+  it("stores worktree setup scripts (multi-line) & init prompts in repo/local project files with .git/info/exclude and git add -f", async () => {
+    const tmpBase = mkdtempSync(path.join(os.tmpdir(), "avent-wt-files-"));
+    const repoDir = path.join(tmpBase, "repo");
+    const wtRootDir = path.join(tmpBase, "wt-root");
+    const dbDir = path.join(tmpBase, ".avent-db");
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(wtRootDir, { recursive: true });
+
+    const gitSync = (cwd: string, args: string[]) =>
+      execFileSync("git", args, {
+        cwd,
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },
+      }).trim();
+
+    gitSync(repoDir, ["init", "-b", "main"]);
+    gitSync(repoDir, ["config", "user.name", "Tester"]);
+    gitSync(repoDir, ["config", "user.email", "tester@local"]);
+    // Simulate a repo whose .gitignore ignores `.avent/` (just like Avent itself!)
+    writeFileSync(path.join(repoDir, ".gitignore"), ".avent/\n", "utf8");
+    writeFileSync(path.join(repoDir, "README.md"), "hello\n", "utf8");
+    gitSync(repoDir, ["add", "-A"]);
+    gitSync(repoDir, ["commit", "-m", "initial"]);
+
+    const store = new AventStore(dbDir, repoDir);
+    try {
+      const ws = store.updateWorkspace(store.listWorkspaces()[0]!.id, {
+        worktreeRoot: wtRootDir,
+      })!;
+
+      // 1. Initial read detects repo path would be ignored by `.gitignore`
+      const initialCfg = await readWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+      });
+      assert.equal(initialCfg.isGitRepo, true);
+      assert.equal(initialCfg.repo.exists, false);
+      assert.equal(initialCfg.repo.gitState, "absent");
+      assert.equal(initialCfg.repo.wouldBeIgnored, true);
+      assert.equal(initialCfg.local.exists, false);
+
+      // 2. Save multi-line Repo config WITHOUT forceTrackRepo -> saved to .avent/worktree.json, gitState = "ignored"
+      const repoScript = [
+        "# Repo multi-line setup script",
+        'node -e "require(\'fs\').appendFileSync(\'order.log\', \'repo-1\\n\')"',
+        'node -e "require(\'fs\').appendFileSync(\'order.log\', \'repo-2:\' + (process.env.AVENT_WORKTREE_BRANCH || \'\') + \'\\n\')"',
+      ].join("\n");
+      const savedRepo = await saveWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "repo",
+        setupCommand: repoScript,
+        initPrompt: "仓库约定：先确认依赖版本。",
+        forceTrackRepo: false,
+      });
+      assert.equal(existsSync(path.join(repoDir, ".avent", "worktree.json")), true);
+      assert.equal(savedRepo.forceTracked, false);
+      assert.equal(savedRepo.config.repo.gitState, "ignored");
+      assert.equal(gitSync(repoDir, ["status", "--porcelain"]), "");
+
+      // 3. Force-track Repo config (`git add -f`) -> now tracked even though `.gitignore` has `.avent/`!
+      const trackedCfg = await runWorktreeConfigGitAction({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "repo",
+        action: "force_track",
+      });
+      assert.equal(trackedCfg.repo.gitState, "tracked");
+      assert.ok(gitSync(repoDir, ["status", "--porcelain"]).includes(".avent/worktree.json"));
+
+      // Untrack moves it back to ignored while keeping the file on disk
+      const untrackedCfg = await runWorktreeConfigGitAction({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "repo",
+        action: "untrack",
+      });
+      assert.equal(untrackedCfg.repo.gitState, "ignored");
+      assert.equal(existsSync(path.join(repoDir, ".avent", "worktree.json")), true);
+
+      // Re-save with `forceTrackRepo: true` -> auto force-tracks!
+      const reSavedRepo = await saveWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "repo",
+        setupCommand: repoScript,
+        initPrompt: "仓库约定：先确认依赖版本。",
+        forceTrackRepo: true,
+      });
+      assert.equal(reSavedRepo.forceTracked, true);
+      assert.equal(reSavedRepo.config.repo.gitState, "tracked");
+
+      // 4. Save multi-line Local config (PowerShell idiom on Windows, sh on Unix) -> auto-excluded in .git/info/exclude without touching .gitignore!
+      const localScript =
+        process.platform === "win32"
+          ? [
+              "$mainPath = $env:AVENT_MAIN_WORKSPACE",
+              'Add-Content -Path "order.log" -Value ("local-ps:" + $mainPath)',
+            ].join("\n")
+          : [
+              'echo "local-sh:$AVENT_MAIN_WORKSPACE" >> order.log',
+            ].join("\n");
+      const savedLocal = await saveWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "local",
+        setupCommand: localScript,
+        initPrompt: "Windows 用目录联接 mklink /J，其他系统用符号链接 ln -s 把主目录的 node_modules 联接到工作树里。",
+      });
+      assert.equal(existsSync(path.join(repoDir, ".avent", "worktree.local.json")), true);
+      assert.equal(savedLocal.config.local.excludedInGit, true);
+      assert.equal(savedLocal.config.local.trackedInGit, false);
+      // `.gitignore` must NOT have been modified!
+      assert.equal(readFileSync(path.join(repoDir, ".gitignore"), "utf8"), ".avent/\n");
+      // `.git/info/exclude` MUST contain **/.avent/worktree.local.json!
+      const excludeContent = readFileSync(path.join(repoDir, ".git", "info", "exclude"), "utf8");
+      assert.ok(excludeContent.includes("**/.avent/worktree.local.json"));
+      // Local config must NOT appear in `git status --porcelain`!
+      assert.equal(
+        gitSync(repoDir, ["status", "--porcelain"]).includes("worktree.local.json"),
+        false
+      );
+
+      // Workspace summary flag reflects file config even though DB columns are empty
+      const refreshedWs = store.getWorkspace(ws.id)!;
+      assert.equal(refreshedWs.hasWorktreeInitConfig, true);
+      assert.equal(refreshedWs.worktreeSetupCommand, undefined);
+      assert.equal(refreshedWs.worktreeInitPrompt, undefined);
+
+      // 5. Create Worktree -> runs Repo multi-line script FIRST, then Local multi-line script!
+      const wt = await createTaskWorktree({
+        workspace: refreshedWs,
+        allWorkspaces: [refreshedWs],
+        taskHint: "multiline-test",
+      });
+      assert.equal(wt.setupResult?.ok, true);
+      assert.deepEqual(wt.setupResult?.ranScopes, ["repo", "local"]);
+      const orderLines = readFileSync(path.join(wt.cwd, "order.log"), "utf8")
+        .trim()
+        .split(/\r?\n/);
+      assert.equal(orderLines[0], "repo-1");
+      assert.equal(orderLines[1], `repo-2:${wt.branch}`);
+      assert.ok(
+        orderLines[2].toLowerCase().includes(path.resolve(repoDir).toLowerCase()),
+        `Expected local script line to include AVENT_MAIN_WORKSPACE, got: ${orderLines[2]}`
+      );
+
+      // 6. PulseEngine injects BOTH Repo + Local init prompts on Turn 1!
+      const seenPrompts: string[] = [];
+      const registry = new ProviderRegistry(process.cwd());
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        mockAgentFactory: () =>
+          acp
+            .agent({ name: "mock-wt-file-agent" })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async () => ({ sessionId: "sess-wt-file-1" }))
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              const txt = ctx.params.prompt[0]?.type === "text" ? ctx.params.prompt[0].text : "";
+              seenPrompts.push(txt);
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify({
+                      status: "COMPLETED",
+                      deliverableSummary: "ok",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    })}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const task = store.createTask({
+        workspaceId: refreshedWs.id,
+        cwd: wt.cwd,
+        worktreePath: wt.worktreePath,
+        worktreeBranch: wt.branch,
+        worktreeBaseBranch: wt.baseBranch,
+        worktreeBaseCommit: wt.baseCommit,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        draft: true,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        const unsub = engine.subscribe((ev) => {
+          if (ev.type === "pulse_finished" && ev.taskId === task.id) {
+            unsub();
+            setTimeout(resolve, 20);
+          }
+        });
+      });
+      engine.sendUserMessage(task.id, { text: "开始开发" });
+      await done;
+
+      assert.ok(seenPrompts[0].includes("<worktree_init_instructions"));
+      assert.ok(seenPrompts[0].includes("仓库约定：先确认依赖版本。"));
+      assert.ok(seenPrompts[0].includes("mklink /J"));
+
+      // 7. Clearing Local config deletes .avent/worktree.local.json cleanly
+      await saveWorkspaceWorktreeConfig({
+        workspaceId: ws.id,
+        workspacePath: repoDir,
+        worktreeRoot: wtRootDir,
+        scope: "local",
+        setupCommand: "",
+        initPrompt: "",
+      });
+      assert.equal(existsSync(path.join(repoDir, ".avent", "worktree.local.json")), false);
+
+      await removeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt.worktreePath,
+        branch: wt.branch,
+        deleteBranch: true,
+      });
     } finally {
       store.close();
       rmSync(tmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });

@@ -30,12 +30,43 @@ export interface WorkspaceRecord {
   branch?: string;
   gitClean?: boolean;
   worktreeRoot?: string;
+  hasWorktreeInitConfig?: boolean;
+  /** @deprecated Legacy DB columns kept read-only for fallback; configs now live in .avent/worktree*.json */
   worktreeSetupCommand?: string;
+  /** @deprecated Legacy DB columns kept read-only for fallback; configs now live in .avent/worktree*.json */
   worktreeInitPrompt?: string;
   taskCount?: number;
   runningCount?: number;
   createdAt: string;
   lastActiveAt: string;
+}
+
+export type WorktreeConfigScope = "repo" | "local";
+
+export type WorktreeRepoGitState = "tracked" | "untracked" | "ignored" | "absent" | "no_git";
+
+export interface WorkspaceWorktreeConfig {
+  workspaceId: string;
+  isGitRepo: boolean;
+  worktreeRoot: string;
+  repo: {
+    relPath: string;
+    absPath: string;
+    exists: boolean;
+    gitState: WorktreeRepoGitState;
+    wouldBeIgnored: boolean;
+    setupCommand: string;
+    initPrompt: string;
+  };
+  local: {
+    relPath: string;
+    absPath: string;
+    exists: boolean;
+    excludedInGit: boolean;
+    trackedInGit: boolean;
+    setupCommand: string;
+    initPrompt: string;
+  };
 }
 
 export interface WorktreeLiveStatus {

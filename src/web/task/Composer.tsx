@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import type {
   AttachmentItem,
   PermissionMode,
@@ -17,16 +18,20 @@ export function Composer({
   task,
   draftKey,
   isNewDraft = false,
+  useWorktree = false,
   onDraftConfigChange,
   onCreatedTask,
 }: {
   task: TaskRecord;
   draftKey: string;
   isNewDraft?: boolean;
+  useWorktree?: boolean;
   onDraftConfigChange?: (patch: Partial<NewTaskConfig>) => void;
   onCreatedTask?: (task: TaskRecord) => void;
 }) {
+  const nav = useNavigate();
   const {
+    workspaces,
     tasks,
     providers,
     endpoints,
@@ -36,6 +41,10 @@ export function Composer({
     setComposerDraft,
     clearComposerDraft,
   } = useApp();
+
+  const wsObj = workspaces.find((w) => w.id === task.workspaceId);
+  const isGitRepo = Boolean(wsObj?.isGitRepo);
+  const effectiveUseWorktree = Boolean(isNewDraft && useWorktree && isGitRepo);
 
   // Initialized from persistent draft store; TaskPage passes `key={draftKey}` so switching tasks
   // cleanly remounts with the target task's saved unsent text, attachments, and refs.
@@ -79,10 +88,10 @@ export function Composer({
   useEffect(() => {
     if (!task.workspaceId) return;
     void api
-      .listWorkspaceFiles(task.workspaceId, atQuery ?? "")
+      .listWorkspaceFiles(task.workspaceId, atQuery ?? "", isNewDraft ? undefined : task.id)
       .then((res) => setWsFiles(res.files))
       .catch(() => {});
-  }, [task.workspaceId, atQuery]);
+  }, [task.workspaceId, task.id, isNewDraft, atQuery]);
 
   useEffect(() => {
     void api
@@ -178,10 +187,14 @@ export function Composer({
           modelId: task.modelId,
           thoughtLevel: task.thoughtLevel,
           permissionMode: task.permissionMode,
+          useWorktree: effectiveUseWorktree,
           attachments,
           refs,
         });
         clearComposerDraft(draftKey);
+        if (effectiveUseWorktree) {
+          onDraftConfigChange?.({ useWorktree: false });
+        }
         setTextState("");
         setAttachmentsState([]);
         setRefsState([]);
@@ -233,6 +246,28 @@ export function Composer({
 
   return (
     <>
+      {effectiveUseWorktree && (
+        <div className="wt-draft-tip">
+          <Icon name="branch" size={14} className="accent" />
+          <span className="grow">
+            {wsObj?.gitClean === false
+              ? "独立工作树基于当前分支 HEAD 拉出，不包含主目录未提交改动。"
+              : `发送首条消息时将从 ${wsObj?.branch || "当前分支"} 拉出独立工作树并行运行。`}
+          </span>
+          {(wsObj?.worktreeSetupCommand || wsObj?.worktreeInitPrompt) && (
+            <Chip tone="accent">已配初始化</Chip>
+          )}
+          <button
+            type="button"
+            className="link-btn"
+            style={{ fontSize: 12 }}
+            onClick={() => nav("/settings/worktree")}
+          >
+            初始化设置
+          </button>
+        </div>
+      )}
+
       {!isNewDraft && task.queuedMessages && task.queuedMessages.length > 0 && (
         <div className="queue">
           <div className="queue-head">排队等待发送（{task.queuedMessages.length}）</div>
@@ -509,6 +544,34 @@ export function Composer({
               }
             }}
           />
+
+          {isNewDraft && (
+            <Select<"local" | "worktree">
+              size="sm"
+              borderless
+              placement="top"
+              icon={effectiveUseWorktree ? "branch" : "folder"}
+              value={effectiveUseWorktree ? "worktree" : "local"}
+              options={[
+                {
+                  value: "local",
+                  label: "当前目录",
+                  desc: "直接在工作区文件夹中运行，零额外开销",
+                },
+                {
+                  value: "worktree",
+                  label: "独立工作树",
+                  desc: isGitRepo
+                    ? "拉出独立 Git 分支并行隔离，支持一键安全合回"
+                    : "当前工作区不是 Git 仓库",
+                  disabled: !isGitRepo,
+                },
+              ]}
+              onChange={(mode) => {
+                onDraftConfigChange?.({ useWorktree: mode === "worktree" });
+              }}
+            />
+          )}
 
           <div className="c-right">
             {isRunning && (

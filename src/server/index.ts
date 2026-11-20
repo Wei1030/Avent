@@ -10,6 +10,16 @@ import { ProviderRegistry } from "./providers/registry.js";
 import { PulseEngine } from "./pulse-engine.js";
 import { probeMcpServer } from "./mcp-probe.js";
 import { previewToolPermission } from "./permissions.js";
+import { isPathInsideRoot } from "./shell-parser.js";
+import {
+  abortWorktreeRebase,
+  createTaskWorktree,
+  defaultWorktreesRoot,
+  getTaskWorktreeStatus,
+  mergeTaskWorktree,
+  removeTaskWorktree,
+  validateWorktreeRoot,
+} from "./worktrees.js";
 import { boundedDocRead, searchPulseHistory, surgicalGrep } from "./selective-io.js";
 import {
   thinkingModeToLevels,
@@ -103,6 +113,7 @@ export function createAventApp(options?: {
       endpoints: store.listCompatibleEndpoints(),
       prefs: store.getPreferences(),
       defaultCwd: root,
+      defaultWorktreesRoot: defaultWorktreesRoot(),
     });
   });
 
@@ -134,7 +145,19 @@ export function createAventApp(options?: {
 
   app.patch("/api/workspaces/:id", async (c) => {
     const id = c.req.param("id");
-    const body = await c.req.json<{ pinned?: boolean; name?: string }>();
+    const body = await c.req.json<{
+      pinned?: boolean;
+      name?: string;
+      worktreeRoot?: string;
+      worktreeSetupCommand?: string;
+      worktreeInitPrompt?: string;
+    }>();
+    if (body.worktreeRoot !== undefined && body.worktreeRoot.trim() !== "") {
+      const check = await validateWorktreeRoot(body.worktreeRoot, store.listWorkspaces());
+      if (!check.ok) {
+        return c.json({ error: check.error }, 400);
+      }
+    }
     const ws = store.updateWorkspace(id, body);
     if (!ws) return c.json({ error: "工作区不存在" }, 404);
     const workspaces = store.listWorkspaces();
@@ -199,8 +222,14 @@ export function createAventApp(options?: {
   app.get("/api/workspaces/:id/files", (c) => {
     const ws = store.getWorkspace(c.req.param("id"));
     if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    const taskId = c.req.query("taskId") || "";
+    const task = taskId ? store.getTask(taskId) : null;
+    const baseDir =
+      task && task.workspaceId === ws.id && task.cwd && existsSync(task.cwd)
+        ? task.cwd
+        : ws.path;
     const q = c.req.query("q") || "";
-    return c.json({ files: store.listWorkspaceFiles(ws.path, q, 60) });
+    return c.json({ files: store.listWorkspaceFiles(baseDir, q, 60) });
   });
 
   app.get("/api/workspaces/:id/file-content", (c) => {
@@ -209,17 +238,25 @@ export function createAventApp(options?: {
     const relOrAbs = (c.req.query("path") || "").trim();
     if (!relOrAbs) return c.json({ error: "缺少文件路径" }, 400);
 
+    const taskId = c.req.query("taskId") || "";
+    const task = taskId ? store.getTask(taskId) : null;
+    const baseDir =
+      task && task.workspaceId === ws.id && task.cwd && existsSync(task.cwd)
+        ? task.cwd
+        : ws.path;
+
     // Strip optional `#L10-L25` pointer if passed directly
     const cleanPath = relOrAbs.split("#")[0];
     const resolved = path.isAbsolute(cleanPath)
       ? path.resolve(cleanPath)
-      : path.resolve(ws.path, cleanPath);
+      : path.resolve(baseDir, cleanPath);
 
-    // Ensure target is inside workspace or Avent spills directory
-    const wsNorm = path.resolve(ws.path).toLowerCase();
-    const spillsNorm = path.resolve(store.spillsDir).toLowerCase();
-    const resNorm = resolved.toLowerCase();
-    if (!resNorm.startsWith(wsNorm) && !resNorm.startsWith(spillsNorm)) {
+    // Ensure target is inside task worktree, workspace, or Avent spills directory
+    const allowed =
+      isPathInsideRoot(resolved, baseDir) ||
+      isPathInsideRoot(resolved, ws.path) ||
+      isPathInsideRoot(resolved, store.spillsDir);
+    if (!allowed) {
       return c.json({ error: "出于安全限制，仅支持预览工作区内的文件" }, 403);
     }
     if (!existsSync(resolved)) {
@@ -228,7 +265,7 @@ export function createAventApp(options?: {
     const raw = readFileSync(resolved, "utf8");
     const lines = raw.split(/\r?\n/);
     return c.json({
-      path: path.relative(ws.path, resolved).replace(/\\/g, "/"),
+      path: path.relative(baseDir, resolved).replace(/\\/g, "/"),
       totalLines: lines.length,
       content: lines.slice(0, 800).join("\n"),
       truncated: lines.length > 800,
@@ -277,6 +314,7 @@ export function createAventApp(options?: {
       permissionMode?: PermissionMode;
       pulseMode?: PulseMode;
       draft?: boolean;
+      useWorktree?: boolean;
       attachments?: AttachmentItem[];
       refs?: TaskRef[];
     }>();
@@ -352,12 +390,70 @@ export function createAventApp(options?: {
     const objectiveText = (body.objective ?? "").trim();
     const isDraft = Boolean(body.draft) || objectiveText.length === 0;
 
+    let wtMeta: {
+      worktreePath: string;
+      branch: string;
+      baseBranch: string;
+      baseCommit: string;
+      setupNote?: string;
+      setupWarn?: boolean;
+    } | null = null;
+
+    if (body.useWorktree && !isDraft) {
+      const ws =
+        (body.workspaceId ? store.getWorkspace(body.workspaceId) : null) ??
+        store.getWorkspaceByPath(cwd);
+      if (!ws) {
+        return c.json({ error: "未找到对应工作区，无法创建独立工作树" }, 400);
+      }
+      try {
+        const createdWt = await createTaskWorktree({
+          workspace: ws,
+          allWorkspaces: store.listWorkspaces(),
+          taskHint: body.title || objectiveText,
+        });
+        cwd = createdWt.cwd;
+        let setupNote = "";
+        let setupWarn = false;
+        if (createdWt.setupResult) {
+          const sec = (createdWt.setupResult.durationMs / 1000).toFixed(1);
+          if (createdWt.setupResult.ok) {
+            setupNote = `；初始化命令执行成功（${sec}s）`;
+          } else {
+            setupWarn = true;
+            const tail = createdWt.setupResult.output.slice(-260);
+            setupNote = `；初始化命令失败（退出码 ${createdWt.setupResult.exitCode ?? "timeout"}，${sec}s）${tail ? `：${tail}` : ""}`;
+          }
+        }
+        if (ws.worktreeInitPrompt?.trim()) {
+          setupNote += "；已附带工作区初始化提示词";
+        }
+        wtMeta = {
+          worktreePath: createdWt.worktreePath,
+          branch: createdWt.branch,
+          baseBranch: createdWt.baseBranch,
+          baseCommit: createdWt.baseCommit,
+          setupNote,
+          setupWarn,
+        };
+      } catch (err) {
+        return c.json(
+          { error: err instanceof Error ? err.message : String(err) },
+          400
+        );
+      }
+    }
+
     const task = store.createTask({
       workspaceId: body.workspaceId,
       title: body.title,
       objective: "",
       completionCriteria: body.completionCriteria,
       cwd,
+      worktreePath: wtMeta?.worktreePath,
+      worktreeBranch: wtMeta?.branch,
+      worktreeBaseBranch: wtMeta?.baseBranch,
+      worktreeBaseCommit: wtMeta?.baseCommit,
       providerId,
       modelId: chosenModelId,
       thoughtLevel: chosenThoughtLevel,
@@ -365,6 +461,14 @@ export function createAventApp(options?: {
       pulseMode: body.pulseMode || "micro-stretch",
       draft: true,
     });
+
+    if (wtMeta) {
+      engine.addNotice(
+        task.id,
+        wtMeta.setupWarn ? "warn" : "info",
+        `已创建独立工作树分支 ${wtMeta.branch}（基于 ${wtMeta.baseBranch}）${wtMeta.setupNote || ""}`
+      );
+    }
 
     if (!isDraft && objectiveText) {
       const sent = engine.sendUserMessage(task.id, {
@@ -580,13 +684,155 @@ export function createAventApp(options?: {
     return c.json({ ok: true });
   });
 
-  app.delete("/api/tasks/:id", (c) => {
+  app.delete("/api/tasks/:id", async (c) => {
     const taskId = c.req.param("id");
+    const cleanupWorktree = c.req.query("cleanupWorktree") === "true";
+    const existing = store.getTask(taskId);
     engine.cancelTaskPulse(taskId);
+
+    if (cleanupWorktree && existing?.worktreePath && !existing.worktreeRemoved) {
+      const ws = existing.workspaceId ? store.getWorkspace(existing.workspaceId) : null;
+      if (ws) {
+        await removeTaskWorktree({
+          workspacePath: ws.path,
+          worktreePath: existing.worktreePath,
+          branch: existing.worktreeBranch,
+          deleteBranch: true,
+        });
+        store.invalidateGitCache(ws.path);
+      }
+    }
+
     store.deleteTask(taskId);
     engine.broadcast({ type: "task_deleted", taskId });
     engine.broadcast({ type: "workspace_updated", workspaces: store.listWorkspaces() });
     return c.json({ ok: true });
+  });
+
+  // --- Task Worktree Lifecycle & Safe Merge Back ---
+
+  app.get("/api/tasks/:id/worktree", async (c) => {
+    const task = store.getTask(c.req.param("id"));
+    if (!task) return c.json({ error: "Task not found" }, 404);
+    if (!task.worktreePath || task.worktreeRemoved) {
+      return c.json({ status: null });
+    }
+    const ws = task.workspaceId ? store.getWorkspace(task.workspaceId) : null;
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    const status = await getTaskWorktreeStatus({
+      workspacePath: ws.path,
+      worktreePath: task.worktreePath,
+      branch: task.worktreeBranch || "",
+      baseBranch: task.worktreeBaseBranch || ws.branch || "",
+      mergedAt: task.worktreeMergedAt,
+    });
+    return c.json({ status });
+  });
+
+  app.post("/api/tasks/:id/worktree/merge", async (c) => {
+    const taskId = c.req.param("id");
+    const task = store.getTask(taskId);
+    if (!task) return c.json({ error: "Task not found" }, 404);
+    if (!task.worktreePath || task.worktreeRemoved) {
+      return c.json({ error: "该任务未启用独立工作树或已被清理" }, 400);
+    }
+    if (engine.isTaskPulsing(taskId)) {
+      return c.json({ error: "任务正在执行中，请等待本轮结束或先停止后再执行合回" }, 409);
+    }
+    const ws = task.workspaceId ? store.getWorkspace(task.workspaceId) : null;
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+
+    const body = await c.req
+      .json<{ autoCommit?: boolean; commitMessage?: string }>()
+      .catch(() => ({ autoCommit: undefined, commitMessage: undefined }));
+
+    const result = await mergeTaskWorktree({
+      workspacePath: ws.path,
+      worktreePath: task.worktreePath,
+      branch: task.worktreeBranch || "",
+      baseBranch: task.worktreeBaseBranch || ws.branch || "",
+      autoCommit: body.autoCommit !== false,
+      commitMessage: body.commitMessage?.trim() || task.title || `Avent task ${task.worktreeBranch}`,
+      mergedAt: task.worktreeMergedAt,
+    });
+
+    if (result.outcome === "merged") {
+      const updated = store.updateTaskWorktree(taskId, {
+        worktreeMergedAt: result.status.mergedAt || new Date().toISOString(),
+      });
+      store.invalidateGitCache(ws.path);
+      engine.addNotice(taskId, "good", result.message);
+      if (updated) {
+        engine.broadcast({ type: "task_updated", task: engine.decorateTask(updated)! });
+      }
+      engine.broadcast({ type: "workspace_updated", workspaces: store.listWorkspaces() });
+    } else if (result.outcome === "conflict") {
+      engine.addNotice(taskId, "warn", result.message);
+    }
+
+    return c.json({ result });
+  });
+
+  app.post("/api/tasks/:id/worktree/abort-rebase", async (c) => {
+    const taskId = c.req.param("id");
+    const task = store.getTask(taskId);
+    if (!task || !task.worktreePath || task.worktreeRemoved) {
+      return c.json({ error: "工作树不存在" }, 404);
+    }
+    const ws = task.workspaceId ? store.getWorkspace(task.workspaceId) : null;
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+    try {
+      await abortWorktreeRebase(task.worktreePath);
+      engine.addNotice(taskId, "info", "已在工作树内中止 Rebase，代码已恢复至合并前状态。");
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    const status = await getTaskWorktreeStatus({
+      workspacePath: ws.path,
+      worktreePath: task.worktreePath,
+      branch: task.worktreeBranch || "",
+      baseBranch: task.worktreeBaseBranch || ws.branch || "",
+      mergedAt: task.worktreeMergedAt,
+    });
+    return c.json({ status });
+  });
+
+  app.delete("/api/tasks/:id/worktree", async (c) => {
+    const taskId = c.req.param("id");
+    const task = store.getTask(taskId);
+    if (!task) return c.json({ error: "Task not found" }, 404);
+    if (!task.worktreePath || task.worktreeRemoved) {
+      return c.json({ ok: true, task: engine.decorateTask(task) });
+    }
+    const ws = task.workspaceId ? store.getWorkspace(task.workspaceId) : null;
+    if (!ws) return c.json({ error: "工作区不存在" }, 404);
+
+    const deleteBranch = c.req.query("deleteBranch") !== "false";
+    engine.cancelTaskPulse(taskId);
+
+    const res = await removeTaskWorktree({
+      workspacePath: ws.path,
+      worktreePath: task.worktreePath,
+      branch: task.worktreeBranch,
+      deleteBranch,
+    });
+    store.invalidateGitCache(ws.path);
+
+    const updated = store.updateTaskWorktree(taskId, {
+      cwd: ws.path,
+      worktreeRemoved: true,
+    });
+    engine.addNotice(
+      taskId,
+      res.warning ? "warn" : "info",
+      res.warning
+        ? `已解除工作树关联（${res.warning}）`
+        : `已清理独立工作树目录${res.deletedBranch ? `并删除临时分支 ${task.worktreeBranch}` : ""}。`
+    );
+    const decorated = updated ? engine.decorateTask(updated)! : engine.decorateTask(task)!;
+    engine.broadcast({ type: "task_updated", task: decorated });
+    engine.broadcast({ type: "workspace_updated", workspaces: store.listWorkspaces() });
+    return c.json({ ok: true, ...res, task: decorated });
   });
 
   app.get("/api/approvals", (c) => {

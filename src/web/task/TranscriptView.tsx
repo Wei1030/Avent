@@ -73,6 +73,7 @@ export function TranscriptView({
               key={`steps_${blk[0].id}`}
               steps={blk}
               workspaceId={task.workspaceId}
+              taskId={task.id}
               live={isLiveRunning && idx === blocks.length - 1}
             />
           );
@@ -103,7 +104,7 @@ export function TranscriptView({
                         icon="file"
                         onClick={
                           a.path
-                            ? () => openFilePreview(task.workspaceId, a.path!)
+                            ? () => openFilePreview(task.workspaceId, a.path!, task.id)
                             : undefined
                         }
                       >
@@ -172,10 +173,12 @@ export function TranscriptView({
 const StepsGroup = memo(function StepsGroup({
   steps,
   workspaceId,
+  taskId,
   live,
 }: {
   steps: StepItem[];
   workspaceId: string;
+  taskId: string;
   live: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -230,7 +233,7 @@ const StepsGroup = memo(function StepsGroup({
             st.kind === "thinking" ? (
               <ThinkingBlock key={st.id} item={st} />
             ) : (
-              <ToolCardView key={st.id} tool={st} workspaceId={workspaceId} />
+              <ToolCardView key={st.id} tool={st} workspaceId={workspaceId} taskId={taskId} />
             )
           )}
         </div>
@@ -261,9 +264,11 @@ function ThinkingBlock({
 function ToolCardView({
   tool,
   workspaceId,
+  taskId,
 }: {
   tool: Extract<TranscriptItem, { kind: "tool" }>;
   workspaceId: string;
+  taskId: string;
 }) {
   const { openFilePreview } = useApp();
   const hasBody = Boolean(tool.output || tool.denialMessage);
@@ -286,7 +291,7 @@ function ToolCardView({
             tool.filePath
               ? (e) => {
                   e.stopPropagation();
-                  openFilePreview(workspaceId, tool.filePath!);
+                  openFilePreview(workspaceId, tool.filePath!, taskId);
                 }
               : undefined
           }

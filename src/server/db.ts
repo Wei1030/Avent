@@ -57,7 +57,10 @@ export class AventStore {
   public readonly archiveDir: string;
   public readonly globalSkillsDir: string;
   private db: DatabaseSync;
-  private gitCache = new Map<string, { at: number; branch?: string; clean?: boolean }>();
+  private gitCache = new Map<
+    string,
+    { at: number; isGitRepo: boolean; branch?: string; clean?: boolean }
+  >();
 
   constructor(baseDir: string, defaultWorkspacePath?: string) {
     this.dataDir = baseDir;
@@ -263,6 +266,42 @@ export class AventStore {
     }
     if (!colNames.has("objective_source")) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN objective_source TEXT NOT NULL DEFAULT 'auto';`);
+    }
+    if (!colNames.has("worktree_path")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!colNames.has("worktree_branch")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_branch TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!colNames.has("worktree_base_branch")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_base_branch TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!colNames.has("worktree_base_commit")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_base_commit TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!colNames.has("worktree_merged_at")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_merged_at TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!colNames.has("worktree_removed")) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN worktree_removed INTEGER NOT NULL DEFAULT 0;`);
+    }
+
+    const wsCols = this.db
+      .prepare(`PRAGMA table_info(workspaces)`)
+      .all() as Array<{ name: string }>;
+    const wsColNames = new Set(wsCols.map((c) => c.name));
+    if (!wsColNames.has("worktree_root")) {
+      this.db.exec(`ALTER TABLE workspaces ADD COLUMN worktree_root TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!wsColNames.has("worktree_setup_command")) {
+      this.db.exec(
+        `ALTER TABLE workspaces ADD COLUMN worktree_setup_command TEXT NOT NULL DEFAULT '';`
+      );
+    }
+    if (!wsColNames.has("worktree_init_prompt")) {
+      this.db.exec(
+        `ALTER TABLE workspaces ADD COLUMN worktree_init_prompt TEXT NOT NULL DEFAULT '';`
+      );
     }
 
     const epCols = this.db
@@ -480,15 +519,43 @@ export class AventStore {
     return rows.map((r) => this.mapWorkspaceRow(r));
   }
 
-  public updateWorkspace(id: string, patch: { pinned?: boolean; name?: string }): WorkspaceRecord | null {
+  public updateWorkspace(
+    id: string,
+    patch: {
+      pinned?: boolean;
+      name?: string;
+      worktreeRoot?: string;
+      worktreeSetupCommand?: string;
+      worktreeInitPrompt?: string;
+    }
+  ): WorkspaceRecord | null {
     const ws = this.getWorkspace(id);
     if (!ws) return null;
     const nextPinned = patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : ws.pinned ? 1 : 0;
     const nextName = patch.name?.trim() || ws.name;
+    const nextWtRoot =
+      patch.worktreeRoot !== undefined ? patch.worktreeRoot.trim() : ws.worktreeRoot || "";
+    const nextWtCmd =
+      patch.worktreeSetupCommand !== undefined
+        ? patch.worktreeSetupCommand.trim()
+        : ws.worktreeSetupCommand || "";
+    const nextWtPrompt =
+      patch.worktreeInitPrompt !== undefined
+        ? patch.worktreeInitPrompt.trim()
+        : ws.worktreeInitPrompt || "";
     this.db
-      .prepare(`UPDATE workspaces SET pinned = ?, name = ? WHERE id = ?`)
-      .run(nextPinned, nextName, id);
+      .prepare(
+        `UPDATE workspaces
+         SET pinned = ?, name = ?, worktree_root = ?, worktree_setup_command = ?, worktree_init_prompt = ?
+         WHERE id = ?`
+      )
+      .run(nextPinned, nextName, nextWtRoot, nextWtCmd, nextWtPrompt, id);
     return this.getWorkspace(id);
+  }
+
+  public invalidateGitCache(wsPath?: string): void {
+    if (wsPath) this.gitCache.delete(wsPath);
+    else this.gitCache.clear();
   }
 
   public touchWorkspace(id: string): void {
@@ -502,33 +569,46 @@ export class AventStore {
     this.db.prepare(`DELETE FROM workspaces WHERE id = ?`).run(id);
   }
 
-  private getGitMeta(wsPath: string): { branch?: string; clean?: boolean } {
+  private getGitMeta(wsPath: string): { isGitRepo: boolean; branch?: string; clean?: boolean } {
     const cached = this.gitCache.get(wsPath);
     const now = Date.now();
     if (cached && now - cached.at < 10000) {
-      return { branch: cached.branch, clean: cached.clean };
+      return { isGitRepo: cached.isGitRepo, branch: cached.branch, clean: cached.clean };
     }
-    if (!existsSync(path.join(wsPath, ".git"))) {
-      this.gitCache.set(wsPath, { at: now });
-      return {};
-    }
+    const gitEnv = { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" };
     try {
+      const check = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+        cwd: wsPath,
+        encoding: "utf8",
+        timeout: 1500,
+        windowsHide: true,
+        env: gitEnv,
+      });
+      if (check.status !== 0 || check.stdout.trim() !== "true") {
+        this.gitCache.set(wsPath, { at: now, isGitRepo: false });
+        return { isGitRepo: false };
+      }
       const br = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
         cwd: wsPath,
         encoding: "utf8",
         timeout: 1500,
+        windowsHide: true,
+        env: gitEnv,
       });
       const branch = br.status === 0 ? br.stdout.trim() : undefined;
       const st = spawnSync("git", ["status", "--porcelain"], {
         cwd: wsPath,
         encoding: "utf8",
         timeout: 1500,
+        windowsHide: true,
+        env: gitEnv,
       });
       const clean = st.status === 0 ? st.stdout.trim().length === 0 : undefined;
-      this.gitCache.set(wsPath, { at: now, branch, clean });
-      return { branch, clean };
+      this.gitCache.set(wsPath, { at: now, isGitRepo: true, branch, clean });
+      return { isGitRepo: true, branch, clean };
     } catch {
-      return {};
+      this.gitCache.set(wsPath, { at: now, isGitRepo: false });
+      return { isGitRepo: false };
     }
   }
 
@@ -549,8 +629,14 @@ export class AventStore {
       name: String(r.name),
       path: wsPath,
       pinned: Number(r.pinned) === 1,
+      isGitRepo: git.isGitRepo,
       branch: git.branch,
       gitClean: git.clean,
+      worktreeRoot: r.worktree_root ? String(r.worktree_root) : undefined,
+      worktreeSetupCommand: r.worktree_setup_command
+        ? String(r.worktree_setup_command)
+        : undefined,
+      worktreeInitPrompt: r.worktree_init_prompt ? String(r.worktree_init_prompt) : undefined,
       taskCount: Number(stats.total || 0),
       runningCount: Number(stats.running || 0),
       createdAt: String(r.created_at),
@@ -612,6 +698,10 @@ export class AventStore {
     objective?: string;
     completionCriteria?: string[];
     cwd: string;
+    worktreePath?: string;
+    worktreeBranch?: string;
+    worktreeBaseBranch?: string;
+    worktreeBaseCommit?: string;
     providerId: TaskProviderId;
     modelId: string;
     thoughtLevel: string;
@@ -651,9 +741,11 @@ export class AventStore {
         `INSERT INTO tasks (
           id, workspace_id, title, title_source, original_objective, objective_source,
           completion_criteria_json, steering_json,
-          tags_json, cwd, provider_id, model_id, thought_level, permission_mode, pulse_mode,
+          tags_json, cwd, worktree_path, worktree_branch, worktree_base_branch, worktree_base_commit,
+          worktree_merged_at, worktree_removed,
+          provider_id, model_id, thought_level, permission_mode, pulse_mode,
           status, current_version, pulse_count, total_tokens, latest_state_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, '', 0, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)`
       )
       .run(
         id,
@@ -665,6 +757,10 @@ export class AventStore {
         JSON.stringify(criteria),
         JSON.stringify([]),
         resolvedCwd,
+        input.worktreePath?.trim() || "",
+        input.worktreeBranch?.trim() || "",
+        input.worktreeBaseBranch?.trim() || "",
+        input.worktreeBaseCommit?.trim() || "",
         input.providerId,
         input.modelId,
         input.thoughtLevel,
@@ -676,6 +772,38 @@ export class AventStore {
       );
 
     return this.getTask(id)!;
+  }
+
+  public updateTaskWorktree(
+    taskId: string,
+    patch: {
+      cwd?: string;
+      worktreeMergedAt?: string;
+      worktreeRemoved?: boolean;
+    }
+  ): TaskRecord | null {
+    const cur = this.getTask(taskId);
+    if (!cur) return null;
+    const now = new Date().toISOString();
+    const nextCwd = patch.cwd ? path.resolve(patch.cwd) : cur.cwd;
+    const nextMergedAt =
+      patch.worktreeMergedAt !== undefined ? patch.worktreeMergedAt : cur.worktreeMergedAt || "";
+    const nextRemoved =
+      patch.worktreeRemoved !== undefined
+        ? patch.worktreeRemoved
+          ? 1
+          : 0
+        : cur.worktreeRemoved
+          ? 1
+          : 0;
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET cwd = ?, worktree_merged_at = ?, worktree_removed = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(nextCwd, nextMergedAt, nextRemoved, now, taskId);
+    return this.getTask(taskId);
   }
 
   /**
@@ -2064,6 +2192,12 @@ export class AventStore {
       steeringDirectives: JSON.parse(String(r.steering_json)) as SteeringDirective[],
       tags: r.tags_json ? (JSON.parse(String(r.tags_json)) as string[]) : [],
       cwd: String(r.cwd),
+      worktreePath: r.worktree_path ? String(r.worktree_path) : undefined,
+      worktreeBranch: r.worktree_branch ? String(r.worktree_branch) : undefined,
+      worktreeBaseBranch: r.worktree_base_branch ? String(r.worktree_base_branch) : undefined,
+      worktreeBaseCommit: r.worktree_base_commit ? String(r.worktree_base_commit) : undefined,
+      worktreeMergedAt: r.worktree_merged_at ? String(r.worktree_merged_at) : undefined,
+      worktreeRemoved: Number(r.worktree_removed || 0) === 1,
       providerId: String(r.provider_id) as TaskProviderId,
       modelId: String(r.model_id),
       thoughtLevel: String(r.thought_level),

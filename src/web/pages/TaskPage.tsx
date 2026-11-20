@@ -10,6 +10,7 @@ import { ApprovalPanel } from "../task/ApprovalPanel.js";
 import { Composer } from "../task/Composer.js";
 import { SemanticStatePanel } from "../task/SemanticStatePanel.js";
 import { TranscriptView } from "../task/TranscriptView.js";
+import { WorktreeBar } from "../task/WorktreeBar.js";
 import { cx, isPlainEnter, relTime, taskStatusDisplay } from "../lib/format.js";
 
 export function TaskPage() {
@@ -31,7 +32,7 @@ export function TaskPage() {
     getNewTaskConfig,
     updateNewTaskConfig,
     recordTaskView,
-    confirm,
+    confirmWithOption,
     toast,
     lang,
     t,
@@ -218,18 +219,30 @@ export function TaskPage() {
 
   const handleDeleteTask = async (target: TaskRecord) => {
     const isRunning = target.status === "PULSING" || target.status === "WAITING_APPROVAL";
-    const ok = await confirm({
+    const hasActiveWt = Boolean(target.worktreePath && !target.worktreeRemoved);
+    const baseDetail = isRunning
+      ? "该任务正在运行，确认后将先中止执行，并永久删除其对话记录与状态记忆，此操作无法撤销。"
+      : "将永久删除该任务的全部对话记录与状态记忆，此操作无法撤销。";
+    const wtDetail = hasActiveWt
+      ? `\n\n该任务绑定了独立工作树分支 ${target.worktreeBranch || ""}${target.worktreeMergedAt ? "（已合回主分支）" : "（若尚未合回，勾选清理将一并删除未合并分支）"}。`
+      : "";
+
+    const { ok, checked } = await confirmWithOption({
       title: "删除任务",
       message: `确定要永久删除任务「${target.title}」吗？`,
-      detail: isRunning
-        ? "该任务正在运行，确认后将先中止执行，并永久删除其对话记录与状态记忆，此操作无法撤销。"
-        : "将永久删除该任务的全部对话记录与状态记忆，此操作无法撤销。",
+      detail: `${baseDetail}${wtDetail}`,
       confirmLabel: "确认删除",
       danger: true,
+      checkbox: hasActiveWt
+        ? {
+            label: `同时清理独立工作树目录与分支 (${target.worktreeBranch || ""})`,
+            defaultChecked: Boolean(target.worktreeMergedAt),
+          }
+        : undefined,
     });
     if (!ok) return;
     try {
-      await api.deleteTask(target.id);
+      await api.deleteTask(target.id, { cleanupWorktree: hasActiveWt && checked });
       toast(`已删除任务：${target.title}`, "good");
       if (target.id === id) {
         const next = wsTasks.find((x) => x.id !== target.id);
@@ -280,8 +293,11 @@ export function TaskPage() {
                     <span className={cx("sdot", st.dotClass)} />
                     <div className="grow" style={{ minWidth: 0 }}>
                       <div className="t truncate">{tk.title}</div>
-                      <div className={cx("m", tk.status === "WAITING_APPROVAL" && "warn")}>
-                        {st.label}
+                      <div className={cx("m row", tk.status === "WAITING_APPROVAL" && "warn")} style={{ gap: 4 }}>
+                        <span>{st.label}</span>
+                        {tk.worktreeBranch && !tk.worktreeRemoved && (
+                          <Icon name="branch" size={11} className="accent" />
+                        )}
                       </div>
                     </div>
                   </div>
@@ -317,7 +333,18 @@ export function TaskPage() {
                 <span className={cx("sdot", st.dotClass)} />
                 <div className="grow" style={{ minWidth: 0 }}>
                   <div className="t truncate">{tk.title}</div>
-                  <div className="m">{relTime(tk.updatedAt, lang)}</div>
+                  <div className="m row" style={{ gap: 4 }}>
+                    <span>{relTime(tk.updatedAt, lang)}</span>
+                    {tk.worktreeBranch && !tk.worktreeRemoved && (
+                      <span
+                        className="accent mono truncate"
+                        style={{ fontSize: 10.5 }}
+                        title={`独立工作树分支：${tk.worktreeBranch}`}
+                      >
+                        · {tk.worktreeBranch.replace(/^avent\//, "")}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className="scol-acts" onClick={(e) => e.stopPropagation()}>
                   <Button
@@ -383,7 +410,7 @@ export function TaskPage() {
                 {stDisplay && <Status tone={stDisplay.tone}>{stDisplay.label}</Status>}
               </div>
 
-              {wsObj?.branch && (
+              {wsObj?.branch && (!currentTask.worktreePath || currentTask.worktreeRemoved) && (
                 <Chip mono icon="branch">
                   {wsObj.branch}
                 </Chip>
@@ -409,6 +436,8 @@ export function TaskPage() {
               </Button>
             </header>
 
+            {!isNewDraft && <WorktreeBar task={currentTask} />}
+
             <div ref={transcriptRef} className="transcript">
               <div className="transcript-inner">
                 <TranscriptView
@@ -428,6 +457,7 @@ export function TaskPage() {
                   task={currentTask}
                   draftKey={draftKey}
                   isNewDraft={isNewDraft}
+                  useWorktree={Boolean(draftConfig.useWorktree && wsObj?.isGitRepo)}
                   onDraftConfigChange={(patch) => updateNewTaskConfig(workspaceId, patch)}
                   onCreatedTask={(created) => {
                     if (created.workspaceId) {

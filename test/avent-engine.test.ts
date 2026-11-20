@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
@@ -8,6 +9,14 @@ import { AventStore } from "../src/server/db.js";
 import { ProviderRegistry } from "../src/server/providers/registry.js";
 import { PulseEngine } from "../src/server/pulse-engine.js";
 import { describeToolCall, evaluateToolPermission } from "../src/server/permissions.js";
+import {
+  abortWorktreeRebase,
+  createTaskWorktree,
+  getTaskWorktreeStatus,
+  mergeTaskWorktree,
+  removeTaskWorktree,
+  validateWorktreeRoot,
+} from "../src/server/worktrees.js";
 import {
   boundedDocRead,
   searchPulseHistory,
@@ -962,6 +971,240 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
     } finally {
       store.close();
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it("creates isolated Git worktrees with custom setup command & init prompt, handles rebase/conflict/dirty-main/ff-only merge, and cleans up", async () => {
+    const tmpBase = mkdtempSync(path.join(os.tmpdir(), "avent-wt-test-"));
+    const repoDir = path.join(tmpBase, "repo");
+    const wtRootDir = path.join(tmpBase, "wt-root");
+    const dbDir = path.join(tmpBase, ".avent-db");
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(wtRootDir, { recursive: true });
+
+    const gitSync = (cwd: string, args: string[]) =>
+      execFileSync("git", args, {
+        cwd,
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },
+      }).trim();
+
+    gitSync(repoDir, ["init", "-b", "main"]);
+    gitSync(repoDir, ["config", "user.name", "Tester"]);
+    gitSync(repoDir, ["config", "user.email", "tester@local"]);
+    writeFileSync(path.join(repoDir, "shared.txt"), "line1\n", "utf8");
+    writeFileSync(path.join(repoDir, "main-only.txt"), "v1\n", "utf8");
+    gitSync(repoDir, ["add", "-A"]);
+    gitSync(repoDir, ["commit", "-m", "initial"]);
+
+    const store = new AventStore(dbDir, repoDir);
+    try {
+      const ws = store.listWorkspaces()[0]!;
+      assert.equal(ws.isGitRepo, true);
+      assert.equal(ws.branch, "main");
+
+      // 1. validateWorktreeRoot MUST reject paths inside the git repo itself!
+      const badRoot = await validateWorktreeRoot(path.join(repoDir, "nested-wt"), [ws]);
+      assert.equal(badRoot.ok, false);
+      const goodRoot = await validateWorktreeRoot(wtRootDir, [ws]);
+      assert.equal(goodRoot.ok, true);
+
+      // Configure workspace setup command + init prompt + outside worktreeRoot
+      const updatedWs = store.updateWorkspace(ws.id, {
+        worktreeRoot: wtRootDir,
+        worktreeSetupCommand:
+          'node -e "require(\'fs\').writeFileSync(\'setup-marker.txt\', process.env.AVENT_MAIN_WORKSPACE || \'\')"',
+        worktreeInitPrompt: "先检查 setup-marker.txt 是否已生成，再执行任务。",
+      })!;
+
+      // 2. Create Task Worktree #1 -> runs setup command with AVENT_MAIN_WORKSPACE!
+      const wt1 = await createTaskWorktree({
+        workspace: updatedWs,
+        allWorkspaces: [updatedWs],
+        taskHint: "feature-alpha",
+      });
+      assert.equal(wt1.baseBranch, "main");
+      assert.ok(wt1.branch.startsWith("avent/feature-alpha-"));
+      assert.equal(wt1.setupResult?.ok, true);
+      assert.equal(
+        readFileSync(path.join(wt1.cwd, "setup-marker.txt"), "utf8").toLowerCase(),
+        path.resolve(repoDir).toLowerCase()
+      );
+      // Clean up untracked setup marker before merge tests
+      rmSync(path.join(wt1.cwd, "setup-marker.txt"), { force: true });
+
+      // 3. Verify PulseEngine injects <worktree_init_instructions> on Turn 1 of a worktree task!
+      const seenPrompts: string[] = [];
+      const registry = new ProviderRegistry(process.cwd());
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        mockAgentFactory: () =>
+          acp
+            .agent({ name: "mock-wt-agent" })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async (ctx) => {
+              // ACP session cwd MUST point directly to the worktree!
+              assert.equal(
+                path.resolve(ctx.params.cwd).toLowerCase(),
+                path.resolve(wt1.cwd).toLowerCase()
+              );
+              return { sessionId: "sess-wt-1" };
+            })
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              const txt = ctx.params.prompt[0]?.type === "text" ? ctx.params.prompt[0].text : "";
+              seenPrompts.push(txt);
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify({
+                      status: "COMPLETED",
+                      deliverableSummary: "done in worktree",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    })}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const task1 = store.createTask({
+        workspaceId: updatedWs.id,
+        cwd: wt1.cwd,
+        worktreePath: wt1.worktreePath,
+        worktreeBranch: wt1.branch,
+        worktreeBaseBranch: wt1.baseBranch,
+        worktreeBaseCommit: wt1.baseCommit,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        draft: true,
+      });
+
+      const p1Done = new Promise<void>((resolve) => {
+        const unsub = engine.subscribe((ev) => {
+          if (ev.type === "pulse_finished" && ev.taskId === task1.id) {
+            unsub();
+            setTimeout(resolve, 20);
+          }
+        });
+      });
+      engine.sendUserMessage(task1.id, { text: "实现功能 Alpha" });
+      await p1Done;
+
+      assert.ok(seenPrompts[0].includes("<worktree_init_instructions"));
+      assert.ok(seenPrompts[0].includes("先检查 setup-marker.txt 是否已生成"));
+
+      // 4. Advance `main` with a non-conflicting commit, make an uncommitted edit in wt1, then one-click merge!
+      writeFileSync(path.join(repoDir, "main-only.txt"), "v2-on-main\n", "utf8");
+      gitSync(repoDir, ["add", "-A"]);
+      gitSync(repoDir, ["commit", "-m", "main advanced"]);
+
+      writeFileSync(path.join(wt1.cwd, "alpha.txt"), "hello from wt1\n", "utf8");
+
+      // Block test: dirty main must NOT be overwritten!
+      writeFileSync(path.join(repoDir, "uncommitted-main.txt"), "wip\n", "utf8");
+      const blocked = await mergeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt1.worktreePath,
+        branch: wt1.branch,
+        baseBranch: wt1.baseBranch,
+        autoCommit: true,
+        commitMessage: "feat: alpha",
+      });
+      assert.equal(blocked.outcome, "blocked_dirty_main");
+      assert.equal(existsSync(path.join(repoDir, "uncommitted-main.txt")), true);
+
+      // Clean main's dirty file -> retry merge -> instant Fast-Forward!
+      rmSync(path.join(repoDir, "uncommitted-main.txt"), { force: true });
+      const merged = await mergeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt1.worktreePath,
+        branch: wt1.branch,
+        baseBranch: wt1.baseBranch,
+      });
+      assert.equal(merged.ok, true);
+      assert.equal(merged.outcome, "merged");
+      assert.equal(readFileSync(path.join(repoDir, "alpha.txt"), "utf8"), "hello from wt1\n");
+      assert.equal(readFileSync(path.join(repoDir, "main-only.txt"), "utf8"), "v2-on-main\n");
+
+      // 5. Conflict isolation test: create wt2, edit SAME line in main & wt2 -> conflict stays ONLY in wt2!
+      const wt2 = await createTaskWorktree({
+        workspace: store.updateWorkspace(ws.id, { worktreeSetupCommand: "" })!,
+        allWorkspaces: [updatedWs],
+        taskHint: "conflict-demo",
+      });
+      writeFileSync(path.join(repoDir, "shared.txt"), "main-edit\n", "utf8");
+      gitSync(repoDir, ["add", "-A"]);
+      gitSync(repoDir, ["commit", "-m", "main edits shared"]);
+
+      writeFileSync(path.join(wt2.cwd, "shared.txt"), "wt2-edit\n", "utf8");
+      const conflictRes = await mergeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt2.worktreePath,
+        branch: wt2.branch,
+        baseBranch: wt2.baseBranch,
+        autoCommit: true,
+        commitMessage: "wt2 edits shared",
+      });
+      assert.equal(conflictRes.ok, false);
+      assert.equal(conflictRes.outcome, "conflict");
+      assert.ok(conflictRes.conflictFiles?.includes("shared.txt"));
+      // Main workspace MUST be 100% untouched!
+      assert.equal(readFileSync(path.join(repoDir, "shared.txt"), "utf8"), "main-edit\n");
+      assert.equal(gitSync(repoDir, ["status", "--porcelain"]), "");
+
+      // Abort rebase in wt2 cleanly
+      await abortWorktreeRebase(wt2.worktreePath);
+      const stAfterAbort = await getTaskWorktreeStatus({
+        workspacePath: repoDir,
+        worktreePath: wt2.worktreePath,
+        branch: wt2.branch,
+        baseBranch: wt2.baseBranch,
+      });
+      assert.equal(stAfterAbort.rebasing, false);
+
+      // 6. Clean up both worktrees & branches
+      const rem1 = await removeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt1.worktreePath,
+        branch: wt1.branch,
+        deleteBranch: true,
+      });
+      assert.equal(rem1.removedDir, true);
+      assert.equal(rem1.deletedBranch, true);
+      assert.equal(existsSync(wt1.worktreePath), false);
+
+      const rem2 = await removeTaskWorktree({
+        workspacePath: repoDir,
+        worktreePath: wt2.worktreePath,
+        branch: wt2.branch,
+        deleteBranch: true,
+      });
+      assert.equal(rem2.removedDir, true);
+      assert.equal(rem2.deletedBranch, true);
+      assert.equal(existsSync(wt2.worktreePath), false);
+    } finally {
+      store.close();
+      rmSync(tmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
     }
   });
 });

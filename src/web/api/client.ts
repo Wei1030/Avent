@@ -20,6 +20,8 @@ import type {
   TaskRef,
   UsageReport,
   WorkspaceRecord,
+  WorktreeLiveStatus,
+  WorktreeMergeResult,
 } from "../../shared/types.js";
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
@@ -47,6 +49,7 @@ export const api = {
       endpoints: CompatibleEndpointRecord[];
       prefs: AppPreferences;
       defaultCwd: string;
+      defaultWorktreesRoot?: string;
     }>("/api/bootstrap"),
 
   listWorkspaces: () => req<{ workspaces: WorkspaceRecord[] }>("/api/workspaces"),
@@ -55,7 +58,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path, name }),
     }),
-  updateWorkspace: (id: string, patch: { pinned?: boolean; name?: string }) =>
+  updateWorkspace: (
+    id: string,
+    patch: {
+      pinned?: boolean;
+      name?: string;
+      worktreeRoot?: string;
+      worktreeSetupCommand?: string;
+      worktreeInitPrompt?: string;
+    }
+  ) =>
     req<{ workspace: WorkspaceRecord; workspaces: WorkspaceRecord[] }>(`/api/workspaces/${id}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
@@ -74,14 +86,14 @@ export const api = {
       directories: Array<{ name: string; path: string }>;
     }>(`/api/fs/browse?path=${encodeURIComponent(path)}`),
 
-  listWorkspaceFiles: (wsId: string, q = "") =>
+  listWorkspaceFiles: (wsId: string, q = "", taskId?: string) =>
     req<{ files: string[] }>(
-      `/api/workspaces/${encodeURIComponent(wsId)}/files?q=${encodeURIComponent(q)}`
+      `/api/workspaces/${encodeURIComponent(wsId)}/files?q=${encodeURIComponent(q)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ""}`
     ),
 
-  readWorkspaceFile: (wsId: string, filePath: string) =>
+  readWorkspaceFile: (wsId: string, filePath: string, taskId?: string) =>
     req<{ path: string; totalLines: number; content: string; truncated: boolean }>(
-      `/api/workspaces/${encodeURIComponent(wsId)}/file-content?path=${encodeURIComponent(filePath)}`
+      `/api/workspaces/${encodeURIComponent(wsId)}/file-content?path=${encodeURIComponent(filePath)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ""}`
     ),
 
   listTasks: (workspaceId?: string) =>
@@ -99,6 +111,7 @@ export const api = {
     thoughtLevel?: string;
     permissionMode?: PermissionMode;
     draft?: boolean;
+    useWorktree?: boolean;
     attachments?: AttachmentItem[];
     refs?: TaskRef[];
   }) =>
@@ -164,8 +177,32 @@ export const api = {
   resumeTask: (id: string) =>
     req<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(id)}/resume`, { method: "POST" }),
 
-  deleteTask: (id: string) =>
-    req<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteTask: (id: string, opts?: { cleanupWorktree?: boolean }) =>
+    req<{ ok: boolean }>(
+      `/api/tasks/${encodeURIComponent(id)}${opts?.cleanupWorktree ? "?cleanupWorktree=true" : ""}`,
+      { method: "DELETE" }
+    ),
+
+  getTaskWorktree: (id: string) =>
+    req<{ status: WorktreeLiveStatus | null }>(`/api/tasks/${encodeURIComponent(id)}/worktree`),
+
+  mergeTaskWorktree: (id: string, body?: { autoCommit?: boolean; commitMessage?: string }) =>
+    req<{ result: WorktreeMergeResult }>(`/api/tasks/${encodeURIComponent(id)}/worktree/merge`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  abortWorktreeRebase: (id: string) =>
+    req<{ status: WorktreeLiveStatus }>(
+      `/api/tasks/${encodeURIComponent(id)}/worktree/abort-rebase`,
+      { method: "POST" }
+    ),
+
+  removeTaskWorktree: (id: string, deleteBranch = true) =>
+    req<{ ok: boolean; removedDir?: boolean; deletedBranch?: boolean; warning?: string; task: TaskRecord }>(
+      `/api/tasks/${encodeURIComponent(id)}/worktree?deleteBranch=${deleteBranch ? "true" : "false"}`,
+      { method: "DELETE" }
+    ),
 
   decideApproval: (approvalId: string, payload: ApprovalDecisionPayload) =>
     req<{ ok: boolean }>(`/api/approvals/${encodeURIComponent(approvalId)}/decide`, {

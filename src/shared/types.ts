@@ -26,12 +26,41 @@ export interface WorkspaceRecord {
   name: string;
   path: string;
   pinned: boolean;
+  isGitRepo?: boolean;
   branch?: string;
   gitClean?: boolean;
+  worktreeRoot?: string;
+  worktreeSetupCommand?: string;
+  worktreeInitPrompt?: string;
   taskCount?: number;
   runningCount?: number;
   createdAt: string;
   lastActiveAt: string;
+}
+
+export interface WorktreeLiveStatus {
+  exists: boolean;
+  path: string;
+  branch: string;
+  baseBranch: string;
+  ahead: number;
+  behind: number;
+  dirtyFiles: string[];
+  rebasing: boolean;
+  conflictFiles: string[];
+  merged: boolean;
+  mergedAt?: string;
+  mainBranch?: string;
+  mainDirtyCount?: number;
+}
+
+export interface WorktreeMergeResult {
+  ok: boolean;
+  outcome: "merged" | "nothing_to_merge" | "conflict" | "blocked_dirty_main" | "error";
+  message: string;
+  conflictFiles?: string[];
+  mainDirtyFiles?: string[];
+  status: WorktreeLiveStatus;
 }
 
 export interface SteeringDirective {
@@ -248,6 +277,12 @@ export interface TaskRecord {
   steeringDirectives: SteeringDirective[];
   tags: string[];
   cwd: string;
+  worktreePath?: string;
+  worktreeBranch?: string;
+  worktreeBaseBranch?: string;
+  worktreeBaseCommit?: string;
+  worktreeMergedAt?: string;
+  worktreeRemoved?: boolean;
   providerId: TaskProviderId;
   modelId: string;
   thoughtLevel: string;

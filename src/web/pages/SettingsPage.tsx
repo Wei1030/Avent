@@ -32,6 +32,10 @@ export function SettingsPage() {
           <Icon name="shield" size={15} />
           <span>{t("权限")}</span>
         </NavLink>
+        <NavLink to="/settings/worktree" className={({ isActive }) => cx(isActive && "active")}>
+          <Icon name="branch" size={15} />
+          <span>工作树</span>
+        </NavLink>
         <NavLink
           to="/settings/instructions"
           className={({ isActive }) => cx(isActive && "active")}
@@ -54,6 +58,7 @@ export function SettingsPage() {
           <Route index element={<Navigate to="provider" replace />} />
           <Route path="general" element={<GeneralSettings />} />
           <Route path="permissions" element={<PermissionsSettings />} />
+          <Route path="worktree" element={<WorktreeSettings />} />
           <Route path="instructions" element={<InstructionsSettings />} />
           <Route path="provider" element={<ProviderSettings />} />
           <Route path="language" element={<LanguageSettings />} />
@@ -600,6 +605,155 @@ function PermissionsSettings() {
           )}
         </div>
       </div>
+    </>
+  );
+}
+
+function WorktreeSettings() {
+  const { activeWorkspace, setWorkspaces, defaultWorktreesRoot, toast } = useApp();
+  const [setupCommand, setSetupCommand] = useState("");
+  const [initPrompt, setInitPrompt] = useState("");
+  const [wtRoot, setWtRoot] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setSetupCommand(activeWorkspace?.worktreeSetupCommand ?? "");
+    setInitPrompt(activeWorkspace?.worktreeInitPrompt ?? "");
+    setWtRoot(activeWorkspace?.worktreeRoot ?? "");
+    setDirty(false);
+  }, [
+    activeWorkspace?.id,
+    activeWorkspace?.worktreeSetupCommand,
+    activeWorkspace?.worktreeInitPrompt,
+    activeWorkspace?.worktreeRoot,
+  ]);
+
+  const handleSave = async () => {
+    if (!activeWorkspace) return;
+    setSaving(true);
+    try {
+      const res = await api.updateWorkspace(activeWorkspace.id, {
+        worktreeSetupCommand: setupCommand.trim(),
+        worktreeInitPrompt: initPrompt.trim(),
+        worktreeRoot: wtRoot.trim(),
+      });
+      setWorkspaces(res.workspaces);
+      setDirty(false);
+      toast("已保存工作树配置", "good");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), "crit");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <h1>并行工作树（Git Worktree）</h1>
+      <p className="lead">
+        同一工作区内多任务并行开发时，可在新建任务输入框底部切换为「独立工作树」。此处配置当前工作区的初始化命令、首个提示词与存放路径。
+      </p>
+
+      {!activeWorkspace ? (
+        <div className="panel">
+          <div className="empty">请先添加一个项目工作区后再配置工作树选项。</div>
+        </div>
+      ) : (
+        <div className="panel">
+          <div className="panel-head">
+            <Icon name="folder" size={16} className="accent" />
+            <h3>{activeWorkspace.name}</h3>
+            <span className="mono muted truncate" style={{ fontSize: 12 }}>
+              {activeWorkspace.path}
+            </span>
+            <span className="grow" />
+            {activeWorkspace.isGitRepo ? (
+              <Chip mono icon="branch" tone="accent">
+                {activeWorkspace.branch || "Git 仓库"}
+              </Chip>
+            ) : (
+              <Status tone="warn">非 Git 仓库</Status>
+            )}
+          </div>
+
+          <div className="panel-body col" style={{ gap: 16 }}>
+            {!activeWorkspace.isGitRepo && (
+              <div className="notice warn">
+                <Icon name="warning" size={15} />
+                <span>当前工作区目录不是 Git 仓库，无法开启独立工作树隔离。</span>
+              </div>
+            )}
+
+            <div className="field">
+              <label>自定义初始化命令（可选）</label>
+              <input
+                className="input mono"
+                placeholder='例如：npm.cmd ci --prefer-offline 或 copy "%AVENT_MAIN_WORKSPACE%\.env" .env'
+                value={setupCommand}
+                onChange={(e) => {
+                  setSetupCommand(e.target.value);
+                  setDirty(true);
+                }}
+              />
+              <div className="hint">
+                每次拉出新工作树后、智能体启动前自动在该工作树目录执行。可用环境变量：
+                <code className="mono">AVENT_MAIN_WORKSPACE</code>（主工作区路径）、
+                <code className="mono">AVENT_WORKTREE_PATH</code>、
+                <code className="mono">AVENT_WORKTREE_BRANCH</code>。
+              </div>
+            </div>
+
+            <div className="field">
+              <label>附带初始化提示词（可选）</label>
+              <textarea
+                className="textarea"
+                style={{ minHeight: 100 }}
+                placeholder="例如：这是刚拉出的独立工作树。请先检查依赖和本地 .env 配置是否齐备，如需初始化请先完成准备，再开始处理我的主要需求。"
+                value={initPrompt}
+                onChange={(e) => {
+                  setInitPrompt(e.target.value);
+                  setDirty(true);
+                }}
+              />
+              <div className="hint">
+                开启「独立工作树」创建任务时，此段内容会自动附带在发给模型的首个输入中，让模型按你的要求自行完成环境初始化。
+              </div>
+            </div>
+
+            <div className="field">
+              <label>工作树存放根目录（可选）</label>
+              <input
+                className="input mono"
+                placeholder={
+                  defaultWorktreesRoot
+                    ? `留空默认：${defaultWorktreesRoot}`
+                    : "留空使用系统用户目录下的 .avent/worktrees"
+                }
+                value={wtRoot}
+                onChange={(e) => {
+                  setWtRoot(e.target.value);
+                  setDirty(true);
+                }}
+              />
+              <div className="hint">
+                必须为位于所有 Git 仓库外部的完整绝对路径，防止主仓库扫描到嵌套副本。
+              </div>
+            </div>
+
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <Button
+                variant="primary"
+                busy={saving}
+                disabled={!dirty}
+                onClick={() => void handleSave()}
+              >
+                保存工作树配置
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

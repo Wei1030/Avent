@@ -34,6 +34,7 @@ export interface ToastItem {
 
 export interface FilePreviewTarget {
   workspaceId: string;
+  taskId?: string;
   pointer: string;
   filePath: string;
   startLine?: number;
@@ -51,6 +52,7 @@ export interface NewTaskConfig {
   modelId?: string;
   thoughtLevel?: string;
   permissionMode?: PermissionMode;
+  useWorktree?: boolean;
 }
 
 export interface ConfirmOptions {
@@ -60,6 +62,10 @@ export interface ConfirmOptions {
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  checkbox?: {
+    label: string;
+    defaultChecked?: boolean;
+  };
 }
 
 const EMPTY_DRAFT: ComposerDraft = {
@@ -117,10 +123,11 @@ interface AppContextValue {
   folderPickerOpen: boolean;
   setFolderPickerOpen: (open: boolean) => void;
   filePreview: FilePreviewTarget | null;
-  openFilePreview: (workspaceId: string, pointer: string) => void;
+  openFilePreview: (workspaceId: string, pointer: string, taskId?: string) => void;
   closeFilePreview: () => void;
   statePanelOpen: boolean;
   setStatePanelOpen: (open: boolean) => void;
+  defaultWorktreesRoot: string;
   // Persistent per-task & new-task composer drafts
   getComposerDraft: (key: string) => ComposerDraft;
   setComposerDraft: (key: string, draft: ComposerDraft) => void;
@@ -135,7 +142,8 @@ interface AppContextValue {
   // In-app confirmation modal
   confirmState: ConfirmOptions | null;
   confirm: (options: ConfirmOptions) => Promise<boolean>;
-  resolveConfirm: (accepted: boolean) => void;
+  confirmWithOption: (options: ConfirmOptions) => Promise<{ ok: boolean; checked: boolean }>;
+  resolveConfirm: (accepted: boolean, checked?: boolean) => void;
 }
 
 const DEFAULT_PREFS: AppPreferences = {
@@ -164,29 +172,40 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [filePreview, setFilePreview] = useState<FilePreviewTarget | null>(null);
+  const [defaultWorktreesRoot, setDefaultWorktreesRoot] = useState("");
   const [confirmState, setConfirmState] = useState<ConfirmOptions | null>(null);
-  const confirmResolverRef = useRef<((ok: boolean) => void) | null>(null);
+  const confirmResolverRef = useRef<((res: { ok: boolean; checked: boolean }) => void) | null>(null);
   const [statePanelOpen, setStatePanelOpenState] = useState<boolean>(
     () => localStorage.getItem("avent.statePanelOpen") !== "false"
   );
 
-  const confirm = useCallback((options: ConfirmOptions): Promise<boolean> => {
-    // If an earlier dialog was somehow pending, resolve it as cancelled first
-    if (confirmResolverRef.current) {
-      confirmResolverRef.current(false);
-      confirmResolverRef.current = null;
-    }
-    setConfirmState(options);
-    return new Promise<boolean>((resolve) => {
-      confirmResolverRef.current = resolve;
-    });
-  }, []);
+  const confirmWithOption = useCallback(
+    (options: ConfirmOptions): Promise<{ ok: boolean; checked: boolean }> => {
+      if (confirmResolverRef.current) {
+        confirmResolverRef.current({ ok: false, checked: false });
+        confirmResolverRef.current = null;
+      }
+      setConfirmState(options);
+      return new Promise<{ ok: boolean; checked: boolean }>((resolve) => {
+        confirmResolverRef.current = resolve;
+      });
+    },
+    []
+  );
 
-  const resolveConfirm = useCallback((accepted: boolean) => {
+  const confirm = useCallback(
+    async (options: ConfirmOptions): Promise<boolean> => {
+      const res = await confirmWithOption(options);
+      return res.ok;
+    },
+    [confirmWithOption]
+  );
+
+  const resolveConfirm = useCallback((accepted: boolean, checked = false) => {
     const fn = confirmResolverRef.current;
     confirmResolverRef.current = null;
     setConfirmState(null);
-    fn?.(accepted);
+    fn?.({ ok: accepted, checked });
   }, []);
 
   // Ref-backed composer drafts (zero app-wide re-renders while typing, always synchronously persisted)
@@ -311,6 +330,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setProviders(data.providers);
       setEndpoints(data.endpoints ?? []);
       setPrefs(data.prefs);
+      if (data.defaultWorktreesRoot) {
+        setDefaultWorktreesRoot(data.defaultWorktreesRoot);
+      }
       return { workspaces: data.workspaces, tasks: data.tasks };
     } catch {
       return null;
@@ -340,16 +362,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setPrefs(res.prefs);
   }, []);
 
-  const openFilePreview = useCallback((workspaceId: string, pointer: string) => {
-    const parsed = parseSourcePointer(pointer);
-    setFilePreview({
-      workspaceId,
-      pointer,
-      filePath: parsed.filePath,
-      startLine: parsed.startLine,
-      endLine: parsed.endLine,
-    });
-  }, []);
+  const openFilePreview = useCallback(
+    (workspaceId: string, pointer: string, taskId?: string) => {
+      const parsed = parseSourcePointer(pointer);
+      setFilePreview({
+        workspaceId,
+        taskId,
+        pointer,
+        filePath: parsed.filePath,
+        startLine: parsed.startLine,
+        endLine: parsed.endLine,
+      });
+    },
+    []
+  );
 
   const closeFilePreview = useCallback(() => setFilePreview(null), []);
 
@@ -561,6 +587,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       closeFilePreview,
       statePanelOpen,
       setStatePanelOpen,
+      defaultWorktreesRoot,
       getComposerDraft,
       setComposerDraft,
       clearComposerDraft,
@@ -571,6 +598,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveWorkspaceTaskRoute,
       confirmState,
       confirm,
+      confirmWithOption,
       resolveConfirm,
     }),
     [
@@ -599,6 +627,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       closeFilePreview,
       statePanelOpen,
       setStatePanelOpen,
+      defaultWorktreesRoot,
       getComposerDraft,
       setComposerDraft,
       clearComposerDraft,
@@ -609,6 +638,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveWorkspaceTaskRoute,
       confirmState,
       confirm,
+      confirmWithOption,
       resolveConfirm,
     ]
   );

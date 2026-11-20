@@ -25,7 +25,7 @@ export function FilePreviewModal() {
     setLoading(true);
     setError(null);
     api
-      .readWorkspaceFile(filePreview.workspaceId, filePreview.filePath)
+      .readWorkspaceFile(filePreview.workspaceId, filePreview.filePath, filePreview.taskId)
       .then((res) => {
         setData(res);
         setTimeout(() => {

@@ -278,7 +278,7 @@ export function SemanticStatePanel({
               <StateDetailCards
                 state={latestState}
                 workspaceId={task.workspaceId}
-                onOpenFile={openFilePreview}
+                onOpenFile={(wsId, ptr) => openFilePreview(wsId, ptr, task.id)}
                 t={t}
               />
             )}
@@ -359,7 +359,7 @@ export function SemanticStatePanel({
                   workspaceId={task.workspaceId}
                   onOpenFile={(wsId, ptr) => {
                     setHistoryOpen(false);
-                    openFilePreview(wsId, ptr);
+                    openFilePreview(wsId, ptr, task.id);
                   }}
                   t={t}
                 />

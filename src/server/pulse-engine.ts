@@ -180,6 +180,16 @@ export class PulseEngine {
     return true;
   }
 
+  public addNotice(taskId: string, tone: "good" | "info" | "warn", text: string): void {
+    this.upsertAndBroadcastItem(taskId, {
+      id: crypto.randomUUID(),
+      kind: "notice",
+      tone,
+      text,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   /**
    * Sends a user message into a task, expanding `/` skills, attachments, and `@任务` references.
    */
@@ -202,7 +212,13 @@ export class PulseEngine {
     const wasDraft = taskBefore.status === "DRAFT";
     const task = wasDraft ? this.store.activateDraftTask(taskId) : taskBefore;
 
-    const enrichedPrompt = this.buildEnrichedEventPayload(task, rawText, attachments, refs);
+    const enrichedPrompt = this.buildEnrichedEventPayload(
+      task,
+      rawText,
+      attachments,
+      refs,
+      wasDraft
+    );
 
     if (input.interruptCurrent && this.isTaskPulsing(taskId)) {
       this.cancelTaskPulse(taskId);
@@ -247,9 +263,27 @@ export class PulseEngine {
     task: TaskRecord,
     rawText: string,
     attachments: AttachmentItem[],
-    refs: TaskRef[]
+    refs: TaskRef[],
+    isFirstTurn = false
   ): string {
     const sections: string[] = [];
+
+    // On first turn of a Worktree-isolated task, prepend workspace-configured worktree init prompt if present
+    if (isFirstTurn && task.worktreePath && !task.worktreeRemoved && task.workspaceId) {
+      const ws = this.store.getWorkspace(task.workspaceId);
+      const initPrompt = ws?.worktreeInitPrompt?.trim();
+      if (initPrompt) {
+        sections.push(
+          [
+            `<worktree_init_instructions branch="${task.worktreeBranch || ""}" base="${task.worktreeBaseBranch || ""}">`,
+            "当前任务运行在全新创建的独立 Git 工作树目录中（你的当前工作目录即该工作树）。",
+            "在正式执行用户请求之前，请先按照下方工作区初始化提示词准备环境：",
+            initPrompt,
+            "</worktree_init_instructions>",
+          ].join("\n")
+        );
+      }
+    }
 
     // Expand leading `/skill-name` if matching a known skill
     const slashMatch = /^\/([a-z0-9_-]+)(?:\s+([\s\S]*))?$/i.exec(rawText);

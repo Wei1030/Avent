@@ -628,6 +628,36 @@ a:hover { text-decoration: underline; }
 .tile .v { font-size: 25px; font-weight: 700; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
 .tile .s { color: var(--muted); font-size: 11.5px; }
 .usage-grid { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+.quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+.quota-card {
+  border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px;
+  background: var(--surface-2); display: flex; flex-direction: column; gap: 10px;
+}
+.quota-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.quota-card-head b { font-size: 13.5px; color: var(--ink); }
+.quota-group { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+.quota-group:first-child { padding-top: 0; border-top: 0; }
+.quota-group-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.quota-group-head b { font-size: 12.5px; color: var(--ink); white-space: nowrap; }
+.quota-bucket { display: flex; flex-direction: column; gap: 5px; }
+.quota-bucket-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; flex-wrap: wrap; }
+.quota-bucket-label { display: inline-flex; align-items: center; gap: 5px; font-weight: 500; color: var(--ink-2); }
+.quota-bucket-meta { display: inline-flex; align-items: center; gap: 3px; font-variant-numeric: tabular-nums; }
+.quota-bucket-meta .warn { color: var(--warn-ink); }
+.quota-bucket-meta .crit { color: var(--crit); }
+.quota-reset { color: var(--muted); font-size: 11.5px; }
+.quota-bar { height: 7px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
+.quota-bar > div { height: 100%; border-radius: 4px; background: var(--accent); transition: width .25s ease; }
+.quota-bar.warn > div { background: var(--warn); }
+.quota-bar.crit > div { background: var(--crit); }
+
+.rolling-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.rolling-card {
+  border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px;
+  background: var(--surface-2); display: flex; flex-direction: column; gap: 6px;
+}
+.rolling-card b { font-size: 13px; color: var(--ink); }
+.rolling-val { font-size: 20px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .data-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11.5px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .data-table td { padding: 8px; border-bottom: 1px solid #eef0f4; font-variant-numeric: tabular-nums; }

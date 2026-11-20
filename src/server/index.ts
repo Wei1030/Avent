@@ -10,6 +10,7 @@ import { ProviderRegistry } from "./providers/registry.js";
 import { PulseEngine } from "./pulse-engine.js";
 import { probeMcpServer } from "./mcp-probe.js";
 import { previewToolPermission } from "./permissions.js";
+import { QuotaService } from "./quotas.js";
 import { isPathInsideRoot } from "./shell-parser.js";
 import {
   abortWorktreeRebase,
@@ -74,6 +75,17 @@ export function createAventApp(options?: {
     registry,
     projectRoot: root,
     aventApiUrl: `http://127.0.0.1:${port}`,
+  });
+  const quotaService = new QuotaService({
+    store,
+    registry,
+    projectRoot: root,
+    onUpdated: (quotas) => {
+      engine.broadcast({ type: "quotas_updated", quotas });
+    },
+  });
+  engine.setClaudeRateLimitHandler((info) => {
+    quotaService.recordClaudeRateLimitEvent(info);
   });
 
   // Non-blocking background capability probe on fresh installs (discovers live models + per-model thought levels)
@@ -1077,6 +1089,28 @@ export function createAventApp(options?: {
     const range = r === "30d" || r === "all" ? r : "7d";
     const wsId = c.req.query("workspaceId") || undefined;
     return c.json({ report: store.getUsageReport(range, wsId) });
+  });
+
+  app.get("/api/quotas", async (c) => {
+    const refresh = c.req.query("refresh") === "1" || c.req.query("refresh") === "true";
+    const quotas = refresh
+      ? await quotaService.refreshQuotas({ force: false })
+      : quotaService.listCachedQuotas();
+    return c.json({ quotas });
+  });
+
+  app.post("/api/quotas/refresh", async (c) => {
+    let providerId: ProviderId | undefined;
+    try {
+      const body = await c.req.json<{ providerId?: ProviderId }>();
+      if (body.providerId === "agy" || body.providerId === "claude" || body.providerId === "codex") {
+        providerId = body.providerId;
+      }
+    } catch {
+      // empty body refreshes all
+    }
+    const quotas = await quotaService.refreshQuotas({ providerId, force: true });
+    return c.json({ quotas });
   });
 
   app.get("/api/rules", (c) => {

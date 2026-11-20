@@ -10,6 +10,13 @@ import { ProviderRegistry } from "../src/server/providers/registry.js";
 import { PulseEngine } from "../src/server/pulse-engine.js";
 import { describeToolCall, evaluateToolPermission } from "../src/server/permissions.js";
 import {
+  mergeClaudeRateLimitEvent,
+  parseAgyUsageJson,
+  parseClaudeUsagePayload,
+  parseCodexStatusMarkdown,
+  QuotaService,
+} from "../src/server/quotas.js";
+import {
   abortWorktreeRebase,
   createTaskWorktree,
   getTaskWorktreeStatus,
@@ -1458,6 +1465,236 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
     } finally {
       store.close();
       rmSync(tmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
+
+  it("re-attaches usage_ledger when workspace is removed and re-added, computes rolling 5h/7d windows, and parses/captures 5h & weekly quotas across agy/claude/codex", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-quota-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    const store = new AventStore(dbDir, tmpDir);
+    try {
+      const ws = store.listWorkspaces()[0]!;
+      const ep = store.addCompatibleEndpoint({
+        name: "DeepSeek 网关",
+        protocol: "anthropic",
+        baseUrl: "https://api.deepseek.com/anthropic",
+        models: [{ id: "deepseek-reasoner", thinkingMode: "toggle" }],
+      });
+
+      const task = store.createTask({
+        workspaceId: ws.id,
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        draft: false,
+        objective: "测试用量统计",
+      });
+      store.recordUsage({
+        workspaceId: ws.id,
+        taskId: task.id,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        inputTokens: 1200,
+        outputTokens: 800,
+      });
+      store.recordUsage({
+        workspaceId: ws.id,
+        taskId: task.id,
+        providerId: `endpoint:${ep.id}`,
+        modelId: "deepseek-reasoner",
+        inputTokens: 600,
+        outputTokens: 400,
+      });
+
+      // Remove workspace and re-add same folder -> usage_ledger MUST re-attach cleanly (never "未命名工作区"!)
+      store.deleteWorkspace(ws.id);
+      const reAdded = store.addWorkspace(tmpDir, "MyProject");
+      const report = store.getUsageReport("7d");
+      assert.equal(report.byWorkspace.length, 1);
+      assert.equal(report.byWorkspace[0].label, "MyProject");
+      assert.equal(report.byWorkspace[0].totalTokens, 3000);
+
+      // Compatible endpoint label must NOT be mislabeled as "OpenAI Codex"
+      const epRow = report.byModel.find((m) => m.label === "deepseek-reasoner");
+      assert.ok(epRow);
+      assert.equal(epRow.subLabel, "兼容端点 · DeepSeek 网关");
+
+      // Rolling 5h and 7d universal local windows include both agy and compatible endpoint
+      assert.equal(report.rolling5h.totalTokens, 3000);
+      assert.equal(report.rolling5h.turns, 2);
+      assert.equal(report.rolling5h.byProvider.length, 2);
+      assert.equal(report.rolling7d.totalTokens, 3000);
+
+      // 1. Parse agy `-p "/usage" --output-format json`
+      const agySnap = parseAgyUsageJson(
+        JSON.stringify({
+          status: "SUCCESS",
+          num_turns: 0,
+          command: {
+            name: "usage",
+            data: {
+              groups: [
+                {
+                  name: "Gemini Models",
+                  description: "Models within this group: Gemini 4 Neon",
+                  buckets: [
+                    {
+                      id: "gemini-weekly",
+                      name: "Weekly Limit Remaining",
+                      window: "weekly",
+                      remaining_fraction: 0.68,
+                      reset_time: "2026-11-25T01:58:42Z",
+                    },
+                    {
+                      id: "gemini-5h",
+                      name: "Five Hour Limit Remaining",
+                      window: "5h",
+                      remaining_fraction: 0.88,
+                      reset_time: "2026-11-20T06:58:58Z",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        }),
+        { planLabel: "Google AI Ultra" }
+      );
+      assert.equal(agySnap.groups[0].name, "Gemini 模型池");
+      // 5h must be sorted ahead of weekly
+      assert.equal(agySnap.groups[0].buckets[0].window, "5h");
+      assert.equal(agySnap.groups[0].buckets[0].remainingPercent, 88);
+      assert.equal(agySnap.groups[0].buckets[0].usedPercent, 12);
+      assert.equal(agySnap.groups[0].buckets[1].window, "weekly");
+      assert.equal(agySnap.groups[0].buckets[1].remainingPercent, 68);
+
+      // 2. Claude passive rate_limit_event capture via ACP usage_update._meta["_claude/rateLimit"]
+      const registry = new ProviderRegistry(process.cwd(), store);
+      const quotaService = new QuotaService({ store, registry, projectRoot: process.cwd() });
+      const futureResetSec = Math.floor((Date.now() + 3600_000) / 1000);
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        onClaudeRateLimit: (info) => {
+          quotaService.recordClaudeRateLimitEvent(info);
+        },
+        mockAgentFactory: () =>
+          acp
+            .agent({ name: "mock-claude-rl" })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock-claude", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async () => ({ sessionId: "sess-rl-1" }))
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: 500,
+                  size: 200000,
+                  _meta: {
+                    "_claude/rateLimit": {
+                      status: "allowed",
+                      rateLimitType: "five_hour",
+                      utilization: 0.42,
+                      resetsAt: futureResetSec,
+                    },
+                  },
+                },
+              });
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify({
+                      status: "COMPLETED",
+                      deliverableSummary: "ok",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    })}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const claudeTask = store.createTask({
+        workspaceId: reAdded.id,
+        cwd: tmpDir,
+        providerId: "claude",
+        modelId: "claude-sonnet-4-6",
+        thoughtLevel: "high",
+        draft: true,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        const unsub = engine.subscribe((ev) => {
+          if (ev.type === "pulse_finished" && ev.taskId === claudeTask.id) {
+            unsub();
+            setTimeout(resolve, 20);
+          }
+        });
+      });
+      engine.sendUserMessage(claudeTask.id, { text: "测试限流事件捕获" });
+      await done;
+
+      const persistedClaude = store.getProviderQuota("claude");
+      assert.ok(persistedClaude);
+      assert.equal(persistedClaude.source, "passive_event");
+      assert.equal(persistedClaude.groups[0].buckets[0].usedPercent, 42);
+      assert.equal(persistedClaude.groups[0].buckets[0].remainingPercent, 58);
+
+      // Active SDK probe returning `rate_limits: null` MUST preserve the unexpired passive window!
+      const afterNullActive = parseClaudeUsagePayload(
+        { subscription_type: "max", rate_limits_available: true, rate_limits: null },
+        { existing: persistedClaude }
+      );
+      assert.equal(afterNullActive.planLabel, "Claude Max");
+      assert.equal(afterNullActive.groups[0].buckets[0].usedPercent, 42);
+
+      // Also test mergeClaudeRateLimitEvent with seven_day window
+      const withWeekly = mergeClaudeRateLimitEvent(afterNullActive, {
+        status: "allowed_warning",
+        rateLimitType: "seven_day",
+        utilization: 0.87,
+        resetsAt: futureResetSec + 86400,
+      })!;
+      assert.equal(withWeekly.groups[0].buckets.length, 2);
+      assert.equal(withWeekly.groups[0].buckets[1].usedPercent, 87);
+
+      // 3. Parse codex-acp `/status` Markdown output
+      const codexSnap = parseCodexStatusMarkdown(
+        [
+          "**Account:** user@example.com",
+          "**5h limit:** 82% left (resets 2026-11-20T09:00:00Z)",
+          "**Weekly limit:** 65% left (resets 2026-11-25T00:00:00Z)",
+          "**Credits:** $12.50",
+        ].join("\n"),
+        { planLabel: "ChatGPT Pro" }
+      );
+      assert.equal(codexSnap.groups[0].buckets.length, 2);
+      assert.equal(codexSnap.groups[0].buckets[0].window, "5h");
+      assert.equal(codexSnap.groups[0].buckets[0].remainingPercent, 82);
+      assert.equal(codexSnap.groups[0].buckets[1].window, "weekly");
+      assert.equal(codexSnap.groups[0].buckets[1].remainingPercent, 65);
+      assert.ok(codexSnap.extraNote?.includes("$12.50"));
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
     }
   });
 });

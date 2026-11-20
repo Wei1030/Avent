@@ -5,6 +5,7 @@ import type { AventStore } from "./db.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { executeAcpPulse, stripAventStateTag } from "./providers/acp-driver.js";
 import { describeToolCall, evaluateToolPermission } from "./permissions.js";
+import type { RawClaudeRateLimitInfo } from "./quotas.js";
 import { getEffectiveWorktreeConfigSync } from "./worktrees.js";
 import type {
   ApprovalDecisionPayload,
@@ -53,6 +54,7 @@ export class PulseEngine {
   private pendingApprovals = new Map<string, PendingApprovalEntry>();
   private listeners = new Set<(ev: LiveStreamEvent) => void>();
   private mockAgentFactory?: (task: TaskRecord, pulseNumber: number) => acp.AgentApp;
+  private onClaudeRateLimit?: (info: RawClaudeRateLimitInfo) => void;
 
   constructor(opts: {
     store: AventStore;
@@ -60,12 +62,18 @@ export class PulseEngine {
     projectRoot: string;
     aventApiUrl: string;
     mockAgentFactory?: (task: TaskRecord, pulseNumber: number) => acp.AgentApp;
+    onClaudeRateLimit?: (info: RawClaudeRateLimitInfo) => void;
   }) {
     this.store = opts.store;
     this.registry = opts.registry;
     this.mcpBundlePath = path.join(opts.projectRoot, "dist", "avent-mcp.mjs");
     this.aventApiUrl = opts.aventApiUrl;
     this.mockAgentFactory = opts.mockAgentFactory;
+    this.onClaudeRateLimit = opts.onClaudeRateLimit;
+  }
+
+  public setClaudeRateLimitHandler(fn: (info: RawClaudeRateLimitInfo) => void): void {
+    this.onClaudeRateLimit = fn;
   }
 
   public setApiUrl(url: string): void {
@@ -578,6 +586,12 @@ export class PulseEngine {
               providers: this.registry.listProviderStatuses(),
             });
           },
+          onRateLimitEvent:
+            !isCompatibleEndpoint && acpProviderId === "claude"
+              ? (info) => {
+                  this.onClaudeRateLimit?.(info);
+                }
+              : undefined,
           onCheckPermission: async (req) => {
             const latestTask = this.store.getTask(taskId) ?? refreshedTask;
             const rules = this.store.listPermissionRules(latestTask.workspaceId);

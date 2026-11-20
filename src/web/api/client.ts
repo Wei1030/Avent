@@ -12,6 +12,7 @@ import type {
   PermissionMode,
   PermissionRuleRecord,
   ProviderId,
+  ProviderQuotaSnapshot,
   ProviderStatusInfo,
   SkillRecord,
   TaskDetailResponse,
@@ -322,6 +323,17 @@ export const api = {
     req<{ report: UsageReport }>(
       `/api/usage?range=${range}${workspaceId ? `&workspaceId=${encodeURIComponent(workspaceId)}` : ""}`
     ),
+
+  getQuotas: (refresh = false) =>
+    req<{ quotas: ProviderQuotaSnapshot[] }>(
+      refresh ? "/api/quotas?refresh=1" : "/api/quotas"
+    ),
+
+  refreshQuotas: (providerId?: ProviderId) =>
+    req<{ quotas: ProviderQuotaSnapshot[] }>("/api/quotas/refresh", {
+      method: "POST",
+      body: JSON.stringify(providerId ? { providerId } : {}),
+    }),
 
   listRules: (workspaceId?: string) =>
     req<{ rules: PermissionRuleRecord[] }>(

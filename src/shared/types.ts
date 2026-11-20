@@ -550,6 +550,25 @@ export interface UsageBreakdownRow {
   totalTokens: number;
 }
 
+export interface UsageWindowProviderItem {
+  providerId: string;
+  label: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  turns: number;
+}
+
+export interface UsageWindowSummary {
+  hours: number;
+  since: string;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  turns: number;
+  byProvider: UsageWindowProviderItem[];
+}
+
 export interface UsageReport {
   range: "7d" | "30d" | "all";
   totals: {
@@ -560,9 +579,41 @@ export interface UsageReport {
     completedCount: number;
     turnCount: number;
   };
+  rolling5h: UsageWindowSummary;
+  rolling7d: UsageWindowSummary;
   days: UsageDayBucket[];
   byWorkspace: UsageBreakdownRow[];
   byModel: UsageBreakdownRow[];
+}
+
+export interface QuotaWindowBucket {
+  id: string;
+  label: string;
+  window: "5h" | "weekly" | "other";
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt?: string;
+  status?: "allowed" | "allowed_warning" | "rejected";
+  description?: string;
+}
+
+export interface QuotaPoolGroup {
+  id: string;
+  name: string;
+  description?: string;
+  buckets: QuotaWindowBucket[];
+}
+
+export interface ProviderQuotaSnapshot {
+  providerId: ProviderId;
+  providerName: string;
+  available: boolean;
+  planLabel?: string;
+  source: "active_cli" | "active_sdk" | "active_acp" | "passive_event" | "unavailable";
+  checkedAt?: string;
+  groups: QuotaPoolGroup[];
+  extraNote?: string;
+  error?: string;
 }
 
 export interface TaskDetailResponse {
@@ -578,6 +629,7 @@ export type LiveStreamEvent =
   | { type: "workspace_updated"; workspaces: WorkspaceRecord[] }
   | { type: "providers_updated"; providers: ProviderStatusInfo[] }
   | { type: "endpoints_updated"; endpoints: CompatibleEndpointRecord[] }
+  | { type: "quotas_updated"; quotas: ProviderQuotaSnapshot[] }
   | { type: "task_updated"; task: TaskRecord }
   | { type: "task_deleted"; taskId: string }
   | { type: "item_upserted"; taskId: string; item: TranscriptItem }

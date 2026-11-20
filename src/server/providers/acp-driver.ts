@@ -7,6 +7,7 @@ import { getEncoding } from "js-tiktoken";
 import { spillIfOversized } from "../selective-io.js";
 import { describeToolCall } from "../permissions.js";
 import { isPathInsideRoot, resolveCanonicalPath } from "../shell-parser.js";
+import type { RawClaudeRateLimitInfo } from "../quotas.js";
 import type { ProviderLaunchSpec, ProviderRegistry } from "./registry.js";
 import type {
   McpServerRecord,
@@ -100,6 +101,7 @@ export interface ExecuteAcpPulseInput {
   getCommittedState: () => SemanticState | null;
   onFallbackCommit: (draft: SemanticStateCommitDraft) => SemanticState;
   onProvidersUpdated?: () => void;
+  onRateLimitEvent?: (info: RawClaudeRateLimitInfo) => void;
   onCheckPermission?: (req: ToolPermissionCheckInput) => Promise<ToolPermissionCheckResult>;
   onThoughtDelta?: (delta: string) => void;
   onAssistantDelta?: (delta: string) => void;
@@ -694,6 +696,12 @@ export async function executeAcpPulse(
         }
         reportedUsedTokens = u.used;
         peakTotalTokens = Math.max(peakTotalTokens, u.used);
+        const claudeRateLimit = (u._meta as Record<string, unknown> | undefined)?.[
+          "_claude/rateLimit"
+        ];
+        if (claudeRateLimit && typeof claudeRateLimit === "object") {
+          input.onRateLimitEvent?.(claudeRateLimit as RawClaudeRateLimitInfo);
+        }
         emitTelemetry();
       }
     });
@@ -933,6 +941,12 @@ export async function executeAcpPulse(
         input.abortSignal?.removeEventListener("abort", abortListener);
       }
     });
+  } catch (err) {
+    const rl = (err as { data?: { rateLimit?: unknown } } | null)?.data?.rateLimit;
+    if (rl && typeof rl === "object") {
+      input.onRateLimitEvent?.(rl as RawClaudeRateLimitInfo);
+    }
+    throw err;
   } finally {
     for (const t of terminals.values()) {
       killProcessTree(t.proc);

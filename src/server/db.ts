@@ -27,6 +27,7 @@ import type {
   PermissionRuleRecord,
   PersistedProviderCapabilities,
   ProviderId,
+  ProviderQuotaSnapshot,
   PulseMode,
   PulseRecord,
   PulseTraceEntry,
@@ -40,6 +41,8 @@ import type {
   UsageBreakdownRow,
   UsageDayBucket,
   UsageReport,
+  UsageWindowProviderItem,
+  UsageWindowSummary,
   WorkspaceRecord,
 } from "../shared/types.js";
 
@@ -320,6 +323,16 @@ export class AventStore {
       );
     }
 
+    const usageCols = this.db
+      .prepare(`PRAGMA table_info(usage_ledger)`)
+      .all() as Array<{ name: string }>;
+    const usageColNames = new Set(usageCols.map((c) => c.name));
+    if (!usageColNames.has("workspace_path")) {
+      this.db.exec(
+        `ALTER TABLE usage_ledger ADD COLUMN workspace_path TEXT NOT NULL DEFAULT '';`
+      );
+    }
+
     // Seed default safety permission rules once if empty
     const ruleCount = (
       this.db.prepare(`SELECT COUNT(*) as cnt FROM permission_rules`).get() as { cnt: number }
@@ -366,6 +379,45 @@ export class AventStore {
           now
         );
     }
+
+    // Self-heal any orphaned usage_ledger rows whose workspace_id pointed to a removed-and-readded workspace
+    this.db
+      .prepare(
+        `UPDATE usage_ledger
+         SET workspace_id = (
+           SELECT t.workspace_id FROM tasks t WHERE t.id = usage_ledger.task_id
+         )
+         WHERE (workspace_id = '' OR workspace_id NOT IN (SELECT id FROM workspaces))
+           AND task_id IN (
+             SELECT id FROM tasks WHERE workspace_id IN (SELECT id FROM workspaces)
+           )`
+      )
+      .run();
+    // Backfill workspace_path on usage_ledger for existing valid workspaces
+    this.db
+      .prepare(
+        `UPDATE usage_ledger
+         SET workspace_path = (
+           SELECT w.path FROM workspaces w WHERE w.id = usage_ledger.workspace_id
+         )
+         WHERE workspace_path = ''
+           AND workspace_id IN (SELECT id FROM workspaces)`
+      )
+      .run();
+    // Re-attach orphaned usage_ledger rows whose stored workspace_path matches a re-added workspace
+    this.db
+      .prepare(
+        `UPDATE usage_ledger
+         SET workspace_id = (
+           SELECT w.id FROM workspaces w WHERE LOWER(w.path) = LOWER(usage_ledger.workspace_path) LIMIT 1
+         )
+         WHERE workspace_path != ''
+           AND (workspace_id = '' OR workspace_id NOT IN (SELECT id FROM workspaces))
+           AND EXISTS (
+             SELECT 1 FROM workspaces w WHERE LOWER(w.path) = LOWER(usage_ledger.workspace_path)
+           )`
+      )
+      .run();
   }
 
   public ensureDefaultWorkspace(wsPath: string): WorkspaceRecord | null {
@@ -486,6 +538,16 @@ export class AventStore {
     this.db
       .prepare(`INSERT OR REPLACE INTO prefs (key, value_json) VALUES ('workspace_seeded', 'true')`)
       .run();
+    // Collect orphaned old workspace_ids belonging to this folder before re-attaching tasks
+    const oldWsRows = this.db
+      .prepare(
+        `SELECT DISTINCT workspace_id FROM tasks
+         WHERE LOWER(cwd) = LOWER(?)
+           AND workspace_id != ''
+           AND workspace_id NOT IN (SELECT id FROM workspaces)`
+      )
+      .all(resolved) as Array<{ workspace_id: string }>;
+
     // Re-attach any historical tasks for this folder whose workspace entry was previously removed
     this.db
       .prepare(
@@ -495,6 +557,24 @@ export class AventStore {
            AND (workspace_id = '' OR workspace_id NOT IN (SELECT id FROM workspaces))`
       )
       .run(id, resolved);
+    // Re-attach usage_ledger entries belonging to those re-attached tasks, old workspace_ids, or stored workspace_path
+    this.db
+      .prepare(
+        `UPDATE usage_ledger
+         SET workspace_id = ?, workspace_path = ?
+         WHERE (task_id IN (SELECT id FROM tasks WHERE workspace_id = ?) OR LOWER(workspace_path) = LOWER(?))
+           AND workspace_id != ?`
+      )
+      .run(id, resolved, id, resolved, id);
+    for (const oldRow of oldWsRows) {
+      this.db
+        .prepare(
+          `UPDATE usage_ledger
+           SET workspace_id = ?, workspace_path = ?
+           WHERE workspace_id = ?`
+        )
+        .run(id, resolved, oldRow.workspace_id);
+    }
     return this.getWorkspace(id)!;
   }
 
@@ -1812,16 +1892,21 @@ export class AventStore {
     const now = new Date();
     const day = now.toISOString().slice(0, 10);
     const total = entry.inputTokens + entry.outputTokens;
+    const wsPath =
+      (entry.workspaceId ? this.getWorkspace(entry.workspaceId)?.path : undefined) ||
+      this.getTask(entry.taskId)?.cwd ||
+      "";
     this.db
       .prepare(
         `INSERT INTO usage_ledger (
-           id, day, workspace_id, task_id, provider_id, model_id, input_tokens, output_tokens, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           id, day, workspace_id, workspace_path, task_id, provider_id, model_id, input_tokens, output_tokens, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         crypto.randomUUID(),
         day,
         entry.workspaceId,
+        wsPath,
         entry.taskId,
         entry.providerId,
         entry.modelId,
@@ -1832,6 +1917,81 @@ export class AventStore {
     this.db
       .prepare(`UPDATE tasks SET total_tokens = total_tokens + ? WHERE id = ?`)
       .run(total, entry.taskId);
+  }
+
+  private formatProviderDisplayLabel(
+    providerId: string,
+    epById: Map<string, CompatibleEndpointRecord>
+  ): string {
+    if (providerId === "agy") return "Google AI";
+    if (providerId === "claude") return "Claude Code";
+    if (providerId === "codex") return "OpenAI Codex";
+    if (providerId.startsWith("endpoint:")) {
+      const ep = epById.get(providerId.slice("endpoint:".length));
+      return ep ? `兼容端点 · ${ep.name}` : "兼容 API 端点";
+    }
+    return providerId || "其他";
+  }
+
+  private computeRollingWindow(
+    hours: number,
+    epById: Map<string, CompatibleEndpointRecord>,
+    workspaceId?: string
+  ): UsageWindowSummary {
+    const sinceIso = new Date(Date.now() - hours * 3600_000).toISOString();
+    const rows = (
+      workspaceId
+        ? this.db
+            .prepare(
+              `SELECT provider_id, input_tokens, output_tokens
+               FROM usage_ledger
+               WHERE created_at >= ? AND workspace_id = ?`
+            )
+            .all(sinceIso, workspaceId)
+        : this.db
+            .prepare(
+              `SELECT provider_id, input_tokens, output_tokens
+               FROM usage_ledger
+               WHERE created_at >= ?`
+            )
+            .all(sinceIso)
+    ) as Array<Record<string, unknown>>;
+
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const byProvMap = new Map<string, UsageWindowProviderItem>();
+
+    for (const r of rows) {
+      const pid = String(r.provider_id || "");
+      const inT = Number(r.input_tokens || 0);
+      const outT = Number(r.output_tokens || 0);
+      inputTokens += inT;
+      outputTokens += outT;
+
+      const cur = byProvMap.get(pid) ?? {
+        providerId: pid,
+        label: this.formatProviderDisplayLabel(pid, epById),
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        turns: 0,
+      };
+      cur.inputTokens += inT;
+      cur.outputTokens += outT;
+      cur.totalTokens += inT + outT;
+      cur.turns += 1;
+      byProvMap.set(pid, cur);
+    }
+
+    return {
+      hours,
+      since: sinceIso,
+      totalTokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      turns: rows.length,
+      byProvider: [...byProvMap.values()].sort((a, b) => b.totalTokens - a.totalTokens),
+    };
   }
 
   public getUsageReport(range: "7d" | "30d" | "all", workspaceId?: string): UsageReport {
@@ -1848,6 +2008,14 @@ export class AventStore {
             .all(cutoffDate, workspaceId)
         : this.db.prepare(`SELECT * FROM usage_ledger WHERE day >= ?`).all(cutoffDate)
     ) as Array<Record<string, unknown>>;
+
+    const wsList = this.listWorkspaces();
+    const wsLookup = new Map(wsList.map((w) => [w.id, w]));
+    const epById = new Map(this.listCompatibleEndpoints().map((e) => [e.id, e]));
+    const taskMetaRows = this.db
+      .prepare(`SELECT id, workspace_id, cwd FROM tasks`)
+      .all() as Array<{ id: string; workspace_id: string; cwd: string }>;
+    const taskMetaById = new Map(taskMetaRows.map((t) => [t.id, t]));
 
     // Pre-seed continuous calendar days so chart always looks crisp
     const dayMap = new Map<string, UsageDayBucket>();
@@ -1866,7 +2034,7 @@ export class AventStore {
     let totalOut = 0;
     const wsAgg = new Map<
       string,
-      { tasks: Set<string>; turns: number; inTok: number; outTok: number }
+      { tasks: Set<string>; turns: number; inTok: number; outTok: number; fallbackCwd?: string }
     >();
     const modelAgg = new Map<
       string,
@@ -1875,13 +2043,21 @@ export class AventStore {
 
     for (const r of rows) {
       const day = String(r.day);
-      const wsId = String(r.workspace_id);
+      const rawWsId = String(r.workspace_id || "");
       const tid = String(r.task_id);
       const pid = String(r.provider_id);
       const mid = String(r.model_id);
       const inT = Number(r.input_tokens || 0);
       const outT = Number(r.output_tokens || 0);
       const sum = inT + outT;
+
+      // Resolve orphaned workspace_id via current task record if workspace was removed & re-added
+      const taskMeta = taskMetaById.get(tid);
+      const effectiveWsId = wsLookup.has(rawWsId)
+        ? rawWsId
+        : taskMeta && wsLookup.has(taskMeta.workspace_id)
+          ? taskMeta.workspace_id
+          : rawWsId || "__removed__";
 
       totalIn += inT;
       totalOut += outT;
@@ -1896,12 +2072,21 @@ export class AventStore {
       bucket.totalTokens += sum;
       bucket.byProvider[pid] = (bucket.byProvider[pid] ?? 0) + sum;
 
-      const wEntry = wsAgg.get(wsId) ?? { tasks: new Set(), turns: 0, inTok: 0, outTok: 0 };
+      const rowWsPath = String(r.workspace_path || "");
+      const fallbackPath = rowWsPath || taskMeta?.cwd;
+      const wEntry = wsAgg.get(effectiveWsId) ?? {
+        tasks: new Set(),
+        turns: 0,
+        inTok: 0,
+        outTok: 0,
+        fallbackCwd: fallbackPath,
+      };
       wEntry.tasks.add(tid);
       wEntry.turns += 1;
       wEntry.inTok += inT;
       wEntry.outTok += outT;
-      wsAgg.set(wsId, wEntry);
+      if (!wEntry.fallbackCwd && fallbackPath) wEntry.fallbackCwd = fallbackPath;
+      wsAgg.set(effectiveWsId, wEntry);
 
       const mKey = `${pid}:${mid}`;
       const mEntry = modelAgg.get(mKey) ?? {
@@ -1919,30 +2104,27 @@ export class AventStore {
       modelAgg.set(mKey, mEntry);
     }
 
-    const wsLookup = new Map(this.listWorkspaces().map((w) => [w.id, w]));
     const byWorkspace: UsageBreakdownRow[] = [...wsAgg.entries()]
-      .map(([wsId, v]) => ({
-        key: wsId,
-        label: wsLookup.get(wsId)?.name || "未命名工作区",
-        subLabel: wsLookup.get(wsId)?.path,
-        tasks: v.tasks.size,
-        turns: v.turns,
-        inputTokens: v.inTok,
-        outputTokens: v.outTok,
-        totalTokens: v.inTok + v.outTok,
-      }))
+      .map(([wsId, v]) => {
+        const ws = wsLookup.get(wsId);
+        return {
+          key: wsId,
+          label: ws?.name || (v.fallbackCwd ? `${path.basename(v.fallbackCwd)}（已移除）` : "已移除的工作区"),
+          subLabel: ws?.path || v.fallbackCwd,
+          tasks: v.tasks.size,
+          turns: v.turns,
+          inputTokens: v.inTok,
+          outputTokens: v.outTok,
+          totalTokens: v.inTok + v.outTok,
+        };
+      })
       .sort((a, b) => b.totalTokens - a.totalTokens);
 
     const byModel: UsageBreakdownRow[] = [...modelAgg.values()]
       .map((v) => ({
         key: `${v.providerId}:${v.modelId}`,
         label: v.modelId,
-        subLabel:
-          v.providerId === "agy"
-            ? "Google AI"
-            : v.providerId === "claude"
-              ? "Claude Code"
-              : "OpenAI Codex",
+        subLabel: this.formatProviderDisplayLabel(v.providerId, epById),
         tasks: v.tasks.size,
         turns: v.turns,
         inputTokens: v.inTok,
@@ -1964,10 +2146,49 @@ export class AventStore {
         completedCount,
         turnCount: rows.length,
       },
+      rolling5h: this.computeRollingWindow(5, epById, workspaceId),
+      rolling7d: this.computeRollingWindow(24 * 7, epById, workspaceId),
       days: [...dayMap.values()].sort((a, b) => a.day.localeCompare(b.day)),
       byWorkspace,
       byModel,
     };
+  }
+
+  public saveProviderQuota(snapshot: ProviderQuotaSnapshot): void {
+    const key = `provider_quota:${snapshot.providerId}`;
+    this.db
+      .prepare(
+        `INSERT INTO prefs (key, value_json) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`
+      )
+      .run(key, JSON.stringify(snapshot));
+  }
+
+  public getProviderQuota(providerId: ProviderId): ProviderQuotaSnapshot | null {
+    const row = this.db
+      .prepare(`SELECT value_json FROM prefs WHERE key = ?`)
+      .get(`provider_quota:${providerId}`) as { value_json: string } | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value_json) as ProviderQuotaSnapshot;
+    } catch {
+      return null;
+    }
+  }
+
+  public listProviderQuotas(): ProviderQuotaSnapshot[] {
+    const rows = this.db
+      .prepare(`SELECT value_json FROM prefs WHERE key LIKE 'provider_quota:%'`)
+      .all() as Array<{ value_json: string }>;
+    const out: ProviderQuotaSnapshot[] = [];
+    for (const r of rows) {
+      try {
+        out.push(JSON.parse(r.value_json) as ProviderQuotaSnapshot);
+      } catch {
+        // ignore malformed
+      }
+    }
+    return out;
   }
 
   // =========================================================================

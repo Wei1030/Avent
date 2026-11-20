@@ -15,6 +15,7 @@ import type {
   CompatibleEndpointRecord,
   LiveStreamEvent,
   PermissionMode,
+  ProviderQuotaSnapshot,
   ProviderStatusInfo,
   TaskDetailResponse,
   TaskProviderId,
@@ -107,6 +108,8 @@ interface AppContextValue {
   approvals: ApprovalRequest[];
   providers: ProviderStatusInfo[];
   endpoints: CompatibleEndpointRecord[];
+  quotas: ProviderQuotaSnapshot[];
+  setQuotas: (list: ProviderQuotaSnapshot[]) => void;
   prefs: AppPreferences;
   lang: "zh-CN" | "en";
   t: (key: string, vars?: Record<string, string | number>) => string;
@@ -167,6 +170,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [providers, setProviders] = useState<ProviderStatusInfo[]>([]);
   const [endpoints, setEndpoints] = useState<CompatibleEndpointRecord[]>([]);
+  const [quotas, setQuotas] = useState<ProviderQuotaSnapshot[]>([]);
   const [prefs, setPrefs] = useState<AppPreferences>(DEFAULT_PREFS);
   const [taskDetails, setTaskDetails] = useState<Record<string, TaskDetailResponse>>({});
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -408,6 +412,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setEndpoints(ev.endpoints);
           break;
 
+        case "quotas_updated":
+          setQuotas(ev.quotas);
+          break;
+
         case "task_updated": {
           setTasks((prev) => {
             const exists = prev.some((x) => x.id === ev.task.id);
@@ -567,6 +575,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       approvals,
       providers,
       endpoints,
+      quotas,
+      setQuotas,
       prefs,
       lang,
       t,
@@ -610,6 +620,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       approvals,
       providers,
       endpoints,
+      quotas,
+      setQuotas,
       prefs,
       lang,
       t,

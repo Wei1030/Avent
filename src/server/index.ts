@@ -348,21 +348,23 @@ export function createAventApp(options?: {
       ? path.resolve(cleanPath)
       : path.resolve(baseDir, cleanPath);
 
-    // Ensure target is inside task worktree, workspace, or Avent spills directory
-    const allowed =
-      isPathInsideRoot(resolved, baseDir) ||
-      isPathInsideRoot(resolved, ws.path) ||
-      isPathInsideRoot(resolved, store.spillsDir);
-    if (!allowed) {
-      return c.json({ error: "出于安全限制，仅支持预览工作区内的文件" }, 403);
-    }
     if (!existsSync(resolved)) {
       return c.json({ error: "文件不存在" }, 404);
     }
+    const st = statSync(resolved);
+    if (!st.isFile()) {
+      return c.json({ error: "该路径是目录，无法按文件预览" }, 400);
+    }
+    if (st.size > 5 * 1024 * 1024) {
+      return c.json({ error: "文件超过 5 MB，暂不支持直接在线预览" }, 400);
+    }
     const raw = readFileSync(resolved, "utf8");
     const lines = raw.split(/\r?\n/);
+    const displayPath = isPathInsideRoot(resolved, baseDir)
+      ? path.relative(baseDir, resolved).replace(/\\/g, "/")
+      : resolved;
     return c.json({
-      path: path.relative(baseDir, resolved).replace(/\\/g, "/"),
+      path: displayPath,
       totalLines: lines.length,
       content: lines.slice(0, 800).join("\n"),
       truncated: lines.length > 800,

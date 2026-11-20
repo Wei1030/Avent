@@ -107,7 +107,7 @@ export function parseSourcePointer(pointer: string): {
   endLine?: number;
 } {
   const trimmed = pointer.trim();
-  const hashMatch = /^([^#:]+)#L(\d+)(?:-L?(\d+))?$/i.exec(trimmed);
+  const hashMatch = /^(.+?)#L(\d+)(?:-L?(\d+))?$/i.exec(trimmed);
   if (hashMatch) {
     return {
       filePath: hashMatch[1],
@@ -115,7 +115,7 @@ export function parseSourcePointer(pointer: string): {
       endLine: hashMatch[3] ? Number(hashMatch[3]) : Number(hashMatch[2]),
     };
   }
-  const colonMatch = /^([^#:]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$/.exec(trimmed);
+  const colonMatch = /^(.+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$/.exec(trimmed);
   if (colonMatch) {
     return {
       filePath: colonMatch[1],

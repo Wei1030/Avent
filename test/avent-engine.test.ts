@@ -829,7 +829,7 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         "ask"
       );
 
-      // Reading outside workspace asks, whereas reading inside Avent spillsDir is allowed
+      // Reading outside workspace asks in default/acceptEdits, but auto-allows in bypassPermissions!
       const outsideRead = describeToolCall(
         "Read",
         "../../secret.env",
@@ -846,6 +846,33 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         }).action,
         "ask"
       );
+      assert.equal(
+        evaluateToolPermission({
+          mode: "acceptEdits",
+          rules,
+          descriptor: outsideRead,
+          rawName: "Read",
+        }).action,
+        "ask"
+      );
+      assert.equal(
+        evaluateToolPermission({
+          mode: "bypassPermissions",
+          rules,
+          descriptor: outsideRead,
+          rawName: "Read",
+        }).action,
+        "allow"
+      );
+
+      // Pure read-only PowerShell inspection touching an outside notes directory auto-allows in bypassPermissions,
+      // while mutating or redirecting to an outside path STILL asks!
+      const psOutsideInspect =
+        'git status -sb; Write-Host "=== NOTES ==="; Get-ChildItem "../../notes" -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize';
+      assert.equal(evalCmd(psOutsideInspect, "default").res.action, "ask");
+      assert.equal(evalCmd(psOutsideInspect, "bypassPermissions").res.action, "allow");
+      assert.equal(evalCmd('echo hacked > ../../outside.txt', "bypassPermissions").res.action, "ask");
+      assert.equal(evalCmd('Copy-Item package.json ../../outside.json', "bypassPermissions").res.action, "ask");
 
       const spillRead = describeToolCall(
         "Read",

@@ -20,7 +20,7 @@ export function getPermissionModeOptions(t: (key: string) => string): Array<{
     {
       value: "bypassPermissions",
       label: t("全自动执行"),
-      desc: "工作区内自动执行，仅拦截高危与越界操作",
+      desc: "工作区内自动执行并允许读区外文档，仅拦截高危与区外修改",
     },
   ];
 }

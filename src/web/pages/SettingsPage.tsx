@@ -448,8 +448,8 @@ function PermissionsSettings() {
               </tr>
               <tr>
                 <td>
-                  <b>终端命令、删除工作区文件与外部工具</b>
-                  <span className="hint">构建、测试、脚本、删除工作区内文件、git 提交、MCP 工具等</span>
+                  <b>终端命令、删除工作区文件、读取工作区外文件/目录</b>
+                  <span className="hint">构建、测试、脚本、删除工作区内文件、读取区外参考文档、MCP 工具等</span>
                 </td>
                 <td><Status tone="warn">需确认</Status></td>
                 <td><Status tone="warn">需确认</Status></td>
@@ -457,8 +457,8 @@ function PermissionsSettings() {
               </tr>
               <tr>
                 <td>
-                  <b>高危破坏命令与越出工作目录</b>
-                  <span className="hint">删除 .git / 根目录、git reset --hard、远端强推、访问目录外路径</span>
+                  <b>高危破坏命令与工作区外写入 / 删除</b>
+                  <span className="hint">删除 .git / 根目录、git reset --hard、远端强推、修改或删除工作区外文件</span>
                 </td>
                 <td><Status tone="crit">强制确认</Status></td>
                 <td><Status tone="crit">强制确认</Status></td>

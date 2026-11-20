@@ -350,13 +350,43 @@ export type PermissionEvaluationResult =
   | { action: "ask"; provenance: string };
 
 /**
+ * Returns true when an outside-workspace operation is strictly read-only:
+ * - Structured read tools (`Read` / `Grep` / `Glob` / `list_dir` / `fs/read_text_file`), OR
+ * - Clean shell commands (no redirection, command substitution, dynamic eval, or pipe-to-shell)
+ *   where every segment referencing an outside-workspace path is classified `read_only`.
+ * Note: `cd ..` is classified `write_or_unknown`, so directory escapes remain blocked.
+ */
+function isPureOutsideRead(descriptor: NormalizedToolDescriptor): boolean {
+  if (descriptor.isRisky) return false;
+  if (descriptor.category === "read") return true;
+  if (descriptor.category === "shell" && descriptor.shellAnalysis) {
+    const a = descriptor.shellAnalysis;
+    if (
+      a.isRisky ||
+      a.hasRedirection ||
+      a.hasCommandSub ||
+      a.hasDynamicEval ||
+      a.hasPipeToShell ||
+      a.segments.length === 0
+    ) {
+      return false;
+    }
+    const outsideSegs = a.segments.filter((s) => s.outsideWorkspacePaths.length > 0);
+    return outsideSegs.length > 0 && outsideSegs.every((s) => s.classification === "read_only");
+  }
+  return false;
+}
+
+/**
  * Evaluates tool permissions in strict fail-closed precedence order:
  * 1. Explicit `deny` rules (matched against full command AND every split sub-command)
  * 2. Explicit `ask` rules (matched against full command AND every split sub-command)
  * 3. Hard Safety Gates:
- *    - Workspace path boundary escape (always `ask`, even in acceptEdits / bypassPermissions)
- *    - Destructive / high-risk operations (rm, Remove-Item, git reset --hard, pipe-to-shell, file Delete, etc. -> always `ask`)
- * 4. `bypassPermissions` mode (only reached if in-workspace, non-risky, and not denied/asked)
+ *    - Catastrophic / destructive high-risk operations (rm -rf . / .git, git reset --hard, pipe-to-shell, etc. -> always `ask`)
+ *    - Workspace path boundary escape:
+ *      - Pure outside-workspace reads auto-allow in `bypassPermissions` mode;
+ *      - Any outside-workspace write/edit/delete/directory-escape ALWAYS forces `ask`, even in `bypassPermissions`
+ * 4. `bypassPermissions` mode (in-workspace non-catastrophic operations, including local file deletes)
  * 5. Shell compound / hazard gate:
  *    - Redirection (`>` / `>>`), command substitution (`$(...)` / backticks), or dynamic eval (`eval` / `iex` / `bash -c`)
  *      CANNOT piggyback on prefix `allow` rules or built-in read-only whitelist -> forced `ask`
@@ -387,17 +417,26 @@ export function evaluateToolPermission(params: {
   }
 
   // 3. Hard Safety Gates (never bypassed by mode or broad allow rules)
-  if (descriptor.outsideWorkspace) {
-    return {
-      action: "ask",
-      provenance: "越出当前任务工作目录，强制人工确认",
-    };
-  }
-
   if (descriptor.isRisky) {
     return {
       action: "ask",
-      provenance: descriptor.reasons[0] || "检测到高危或删除操作，需人工确认",
+      provenance: descriptor.reasons[0] || "检测到高危或破坏性操作，需人工确认",
+    };
+  }
+
+  if (descriptor.outsideWorkspace) {
+    const pureRead = isPureOutsideRead(descriptor);
+    if (mode === "bypassPermissions" && pureRead) {
+      return {
+        action: "allow",
+        provenance: "全自动执行模式（允许只读访问工作区外目录与文件）",
+      };
+    }
+    return {
+      action: "ask",
+      provenance: pureRead
+        ? "读取工作目录之外的路径（全自动执行模式下将自动放行）"
+        : "涉及工作目录之外的写入或变更操作，强制人工确认",
     };
   }
 

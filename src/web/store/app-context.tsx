@@ -56,6 +56,20 @@ export interface NewTaskConfig {
   useWorktree?: boolean;
 }
 
+export interface TaskScrollState {
+  atBottom: boolean;
+  scrollTop: number;
+  loadedCount: number;
+  anchorBlockKey?: string;
+  anchorOffset?: number;
+  updatedAt: number;
+}
+
+export const INITIAL_TRANSCRIPT_PAGE_SIZE = 60;
+export const OLDER_TRANSCRIPT_PAGE_SIZE = 60;
+const MAX_RESTORE_ITEMS_LIMIT = 400;
+const MAX_STORED_SCROLL_TASKS = 80;
+
 export interface ConfirmOptions {
   title: string;
   message: string;
@@ -78,6 +92,7 @@ const EMPTY_DRAFT: ComposerDraft = {
 const DRAFTS_STORAGE_KEY = "avent.composerDrafts";
 const LAST_TASK_STORAGE_KEY = "avent.lastTaskView";
 const NEW_TASK_CFG_STORAGE_KEY = "avent.newTaskConfig";
+const SCROLL_STATES_STORAGE_KEY = "avent.taskScrollStates";
 
 function safeReadJson<T>(key: string, fallback: T): T {
   try {
@@ -114,7 +129,17 @@ interface AppContextValue {
   lang: "zh-CN" | "en";
   t: (key: string, vars?: Record<string, string | number>) => string;
   taskDetails: Record<string, TaskDetailResponse>;
-  loadTaskDetail: (taskId: string) => Promise<TaskDetailResponse | null>;
+  loadTaskDetail: (
+    taskId: string,
+    opts?: { force?: boolean; limit?: number }
+  ) => Promise<TaskDetailResponse | null>;
+  loadOlderTaskItems: (
+    taskId: string
+  ) => Promise<{ addedCount: number; hasMore: boolean }>;
+  // Per-task transcript scroll position memory
+  getTaskScrollState: (taskId: string) => TaskScrollState | null;
+  saveTaskScrollState: (taskId: string, state: TaskScrollState) => void;
+  clearTaskScrollState: (taskId: string) => void;
   refreshBootstrap: () => Promise<{ workspaces: WorkspaceRecord[]; tasks: TaskRecord[] } | null>;
   updatePrefs: (patch: Partial<AppPreferences>) => Promise<void>;
   setProviders: (list: ProviderStatusInfo[]) => void;
@@ -174,6 +199,66 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [quotas, setQuotas] = useState<ProviderQuotaSnapshot[]>([]);
   const [prefs, setPrefs] = useState<AppPreferences>(DEFAULT_PREFS);
   const [taskDetails, setTaskDetails] = useState<Record<string, TaskDetailResponse>>({});
+  const taskDetailsRef = useRef<Record<string, TaskDetailResponse>>({});
+  taskDetailsRef.current = taskDetails;
+  const inflightDetailRef = useRef<Map<string, Promise<TaskDetailResponse | null>>>(new Map());
+  const inflightOlderRef = useRef<Set<string>>(new Set());
+
+  const scrollStatesRef = useRef<Record<string, TaskScrollState>>(
+    safeReadJson<Record<string, TaskScrollState>>(SCROLL_STATES_STORAGE_KEY, {})
+  );
+  const scrollSaveTimerRef = useRef<number | null>(null);
+
+  const flushScrollStates = useCallback(() => {
+    if (scrollSaveTimerRef.current !== null) {
+      window.clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = null;
+    }
+    const entries = Object.entries(scrollStatesRef.current);
+    if (entries.length > MAX_STORED_SCROLL_TASKS) {
+      entries.sort((a, b) => (b[1]?.updatedAt ?? 0) - (a[1]?.updatedAt ?? 0));
+      scrollStatesRef.current = Object.fromEntries(entries.slice(0, MAX_STORED_SCROLL_TASKS));
+    }
+    safeWriteJson(SCROLL_STATES_STORAGE_KEY, scrollStatesRef.current);
+  }, []);
+
+  useEffect(() => {
+    const onHide = () => flushScrollStates();
+    window.addEventListener("beforeunload", onHide);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.removeEventListener("beforeunload", onHide);
+      window.removeEventListener("pagehide", onHide);
+      flushScrollStates();
+    };
+  }, [flushScrollStates]);
+
+  const getTaskScrollState = useCallback((taskId: string): TaskScrollState | null => {
+    if (!taskId) return null;
+    return scrollStatesRef.current[taskId] ?? null;
+  }, []);
+
+  const saveTaskScrollState = useCallback(
+    (taskId: string, state: TaskScrollState) => {
+      if (!taskId) return;
+      scrollStatesRef.current[taskId] = state;
+      if (scrollSaveTimerRef.current === null) {
+        scrollSaveTimerRef.current = window.setTimeout(() => {
+          flushScrollStates();
+        }, 160);
+      }
+    },
+    [flushScrollStates]
+  );
+
+  const clearTaskScrollState = useCallback(
+    (taskId: string) => {
+      if (!taskId || !(taskId in scrollStatesRef.current)) return;
+      delete scrollStatesRef.current[taskId];
+      flushScrollStates();
+    },
+    [flushScrollStates]
+  );
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [filePreview, setFilePreview] = useState<FilePreviewTarget | null>(null);
@@ -346,21 +431,105 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [setWorkspaces]);
 
-  const loadTaskDetail = useCallback(async (taskId: string) => {
-    try {
-      const detail = await api.getTaskDetail(taskId);
-      setTaskDetails((prev) => ({ ...prev, [taskId]: detail }));
-      setTasks((prev) => {
-        const exists = prev.some((t) => t.id === taskId);
-        return exists
-          ? prev.map((t) => (t.id === taskId ? detail.task : t))
-          : [detail.task, ...prev];
-      });
-      return detail;
-    } catch {
-      return null;
-    }
-  }, []);
+  const loadTaskDetail = useCallback(
+    async (taskId: string, opts?: { force?: boolean; limit?: number }) => {
+      if (!taskId) return null;
+      const cached = taskDetailsRef.current[taskId];
+      if (cached && !opts?.force) {
+        return cached;
+      }
+      const existingReq = inflightDetailRef.current.get(taskId);
+      if (existingReq && !opts?.force) {
+        return existingReq;
+      }
+
+      const savedScroll = scrollStatesRef.current[taskId];
+      const desiredLimit =
+        opts?.limit && opts.limit > 0
+          ? opts.limit
+          : cached && cached.items.length > INITIAL_TRANSCRIPT_PAGE_SIZE
+            ? Math.min(MAX_RESTORE_ITEMS_LIMIT, cached.items.length)
+            : savedScroll && !savedScroll.atBottom && savedScroll.loadedCount > INITIAL_TRANSCRIPT_PAGE_SIZE
+              ? Math.min(MAX_RESTORE_ITEMS_LIMIT, savedScroll.loadedCount)
+              : INITIAL_TRANSCRIPT_PAGE_SIZE;
+
+      let reqPromise: Promise<TaskDetailResponse | null> | null = null;
+      reqPromise = (async (): Promise<TaskDetailResponse | null> => {
+        try {
+          const detail = await api.getTaskDetail(taskId, { limit: desiredLimit });
+          setTaskDetails((prev) => {
+            const next = { ...prev, [taskId]: detail };
+            taskDetailsRef.current = next;
+            return next;
+          });
+          setTasks((prev) => {
+            const exists = prev.some((t) => t.id === taskId);
+            return exists
+              ? prev.map((t) => (t.id === taskId ? detail.task : t))
+              : [detail.task, ...prev];
+          });
+          return detail;
+        } catch {
+          return null;
+        } finally {
+          if (inflightDetailRef.current.get(taskId) === reqPromise) {
+            inflightDetailRef.current.delete(taskId);
+          }
+        }
+      })();
+
+      inflightDetailRef.current.set(taskId, reqPromise);
+      return reqPromise;
+    },
+    []
+  );
+
+  const loadOlderTaskItems = useCallback(
+    async (taskId: string): Promise<{ addedCount: number; hasMore: boolean }> => {
+      if (!taskId || inflightOlderRef.current.has(taskId)) {
+        return { addedCount: 0, hasMore: Boolean(taskDetailsRef.current[taskId]?.itemsMeta?.hasMore) };
+      }
+      const cur = taskDetailsRef.current[taskId];
+      if (!cur || !cur.itemsMeta?.hasMore || cur.itemsMeta.oldestSeq === null) {
+        return { addedCount: 0, hasMore: false };
+      }
+
+      inflightOlderRef.current.add(taskId);
+      try {
+        const page = await api.getTaskItemsPage(taskId, {
+          beforeSeq: cur.itemsMeta.oldestSeq,
+          limit: OLDER_TRANSCRIPT_PAGE_SIZE,
+        });
+        let addedCount = 0;
+        setTaskDetails((prev) => {
+          const latest = prev[taskId];
+          if (!latest) return prev;
+          const existingIds = new Set(latest.items.map((it) => it.id));
+          const uniqueOlder = page.items.filter((it) => !existingIds.has(it.id));
+          addedCount = uniqueOlder.length;
+          const mergedItems = uniqueOlder.length > 0 ? [...uniqueOlder, ...latest.items] : latest.items;
+          const nextDetail: TaskDetailResponse = {
+            ...latest,
+            items: mergedItems,
+            itemsMeta: {
+              totalCount: Math.max(page.totalCount, mergedItems.length),
+              hasMore: page.hasMore,
+              oldestSeq: page.oldestSeq ?? latest.itemsMeta?.oldestSeq ?? null,
+            },
+          };
+          const next = { ...prev, [taskId]: nextDetail };
+          taskDetailsRef.current = next;
+          return next;
+        });
+        return { addedCount, hasMore: page.hasMore };
+      } catch {
+        return { addedCount: 0, hasMore: Boolean(taskDetailsRef.current[taskId]?.itemsMeta?.hasMore) };
+      } finally {
+        inflightOlderRef.current.delete(taskId);
+      }
+    },
+    []
+  );
 
   const updatePrefs = useCallback(async (patch: Partial<AppPreferences>) => {
     const res = await api.savePrefs(patch);
@@ -441,6 +610,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             return copy;
           });
           clearComposerDraft(ev.taskId);
+          clearTaskScrollState(ev.taskId);
           setLastTaskViewByWs((prev) => {
             let changed = false;
             const copy = { ...prev };
@@ -465,7 +635,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
               idx >= 0
                 ? cur.items.map((it, i) => (i === idx ? ev.item : it))
                 : [...cur.items, ev.item];
-            return { ...prev, [ev.taskId]: { ...cur, items: nextItems } };
+            const nextMeta = cur.itemsMeta
+              ? {
+                  ...cur.itemsMeta,
+                  totalCount:
+                    idx >= 0
+                      ? cur.itemsMeta.totalCount
+                      : Math.max(cur.itemsMeta.totalCount + 1, nextItems.length),
+                }
+              : undefined;
+            const next = {
+              ...prev,
+              [ev.taskId]: { ...cur, items: nextItems, itemsMeta: nextMeta },
+            };
+            taskDetailsRef.current = next;
+            return next;
           });
           break;
         }
@@ -531,7 +715,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       es.removeEventListener("avent", onAvent as EventListener);
       es.close();
     };
-  }, [setWorkspaces, clearComposerDraft]);
+  }, [setWorkspaces, clearComposerDraft, clearTaskScrollState]);
 
   const lang = useMemo(() => resolveEffectiveLang(prefs.uiLanguage), [prefs.uiLanguage]);
   const t = useCallback(
@@ -583,6 +767,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       t,
       taskDetails,
       loadTaskDetail,
+      loadOlderTaskItems,
+      getTaskScrollState,
+      saveTaskScrollState,
+      clearTaskScrollState,
       refreshBootstrap,
       updatePrefs,
       setProviders,
@@ -628,6 +816,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       t,
       taskDetails,
       loadTaskDetail,
+      loadOlderTaskItems,
+      getTaskScrollState,
+      saveTaskScrollState,
+      clearTaskScrollState,
       refreshBootstrap,
       updatePrefs,
       setWorkspaces,

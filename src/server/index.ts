@@ -602,14 +602,43 @@ export function createAventApp(options?: {
     const taskId = c.req.param("id");
     const task = store.getTask(taskId);
     if (!task) return c.json({ error: "Task not found" }, 404);
+    const limitRaw = c.req.query("limit");
+    const parsedLimit = limitRaw ? Number(limitRaw) : NaN;
+    const page =
+      Number.isFinite(parsedLimit) && parsedLimit > 0
+        ? store.listTaskItemsPage(taskId, { limit: parsedLimit })
+        : store.listTaskItemsPage(taskId);
     return c.json({
       task: engine.decorateTask(task)!,
-      items: store.listTaskItems(taskId),
+      items: page.items,
+      itemsMeta: {
+        totalCount: page.totalCount,
+        hasMore: page.hasMore,
+        oldestSeq: page.oldestSeq,
+      },
       states: store.listStates(taskId),
       events: store.listEvents(taskId),
       pulses: store.listPulses(taskId, false),
       approvals: engine.listPendingApprovals(taskId),
     });
+  });
+
+  app.get("/api/tasks/:id/items", (c) => {
+    const taskId = c.req.param("id");
+    const task = store.getTask(taskId);
+    if (!task) return c.json({ error: "Task not found" }, 404);
+    const limitRaw = c.req.query("limit");
+    const beforeRaw = c.req.query("beforeSeq");
+    const parsedLimit = limitRaw ? Number(limitRaw) : 60;
+    const parsedBefore = beforeRaw ? Number(beforeRaw) : undefined;
+    const page = store.listTaskItemsPage(taskId, {
+      limit: Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 60,
+      beforeSeq:
+        parsedBefore !== undefined && Number.isFinite(parsedBefore)
+          ? parsedBefore
+          : undefined,
+    });
+    return c.json(page);
   });
 
   app.patch("/api/tasks/:id", async (c) => {

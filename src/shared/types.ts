@@ -618,9 +618,20 @@ export interface ProviderQuotaSnapshot {
   error?: string;
 }
 
+export interface TaskItemsPageMeta {
+  totalCount: number;
+  hasMore: boolean;
+  oldestSeq: number | null;
+}
+
+export interface TaskItemsPageResponse extends TaskItemsPageMeta {
+  items: TranscriptItem[];
+}
+
 export interface TaskDetailResponse {
   task: TaskRecord;
   items: TranscriptItem[];
+  itemsMeta?: TaskItemsPageMeta;
   states: SemanticState[];
   events: AventEvent[];
   pulses: PulseRecord[];

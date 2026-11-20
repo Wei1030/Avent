@@ -1884,4 +1884,113 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
     }
   });
+
+  it("listTaskItemsPage paginates backwards by seq and snaps StepsGroup boundaries cleanly", () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-page-"));
+    const store = new AventStore(tmpDir);
+    try {
+      const task = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "high",
+        permissionMode: "bypassPermissions",
+        draft: true,
+      });
+
+      const baseTime = Date.now();
+      const insertedIds: string[] = [];
+      // Build 5 turns, each: user (turn 1 only) / thinking + 3 tools + text + footer
+      for (let turn = 1; turn <= 5; turn++) {
+        if (turn === 1) {
+          const id = `u_${turn}`;
+          insertedIds.push(id);
+          store.upsertTaskItem(task.id, {
+            id,
+            kind: "user",
+            text: `user msg ${turn}`,
+            attachments: [],
+            refs: [],
+            createdAt: new Date(baseTime + insertedIds.length * 1000).toISOString(),
+          });
+        }
+        const thId = `th_${turn}`;
+        insertedIds.push(thId);
+        store.upsertTaskItem(task.id, {
+          id: thId,
+          kind: "thinking",
+          text: `thinking ${turn}`,
+          seconds: 2,
+          createdAt: new Date(baseTime + insertedIds.length * 1000).toISOString(),
+        });
+        for (let t = 1; t <= 3; t++) {
+          const toolId = `tool_${turn}_${t}`;
+          insertedIds.push(toolId);
+          store.upsertTaskItem(task.id, {
+            id: toolId,
+            kind: "tool",
+            toolCallId: toolId,
+            tool: "Read",
+            detail: `file_${turn}_${t}.ts`,
+            status: "ok",
+            createdAt: new Date(baseTime + insertedIds.length * 1000).toISOString(),
+          });
+        }
+        const txtId = `txt_${turn}`;
+        insertedIds.push(txtId);
+        store.upsertTaskItem(task.id, {
+          id: txtId,
+          kind: "text",
+          text: `reply ${turn}`,
+          createdAt: new Date(baseTime + insertedIds.length * 1000).toISOString(),
+        });
+        const ftId = `ft_${turn}`;
+        insertedIds.push(ftId);
+        store.upsertTaskItem(task.id, {
+          id: ftId,
+          kind: "footer",
+          turn,
+          seconds: 5,
+          toolCalls: 3,
+          tokens: 1000,
+          stateVersion: turn,
+          stopReason: "继续",
+          createdAt: new Date(baseTime + insertedIds.length * 1000).toISOString(),
+        });
+      }
+
+      // Total items = 1 + 5 * 6 = 31
+      assert.equal(insertedIds.length, 31);
+
+      // Page 1: limit = 9 lands on tool_4_3 in the middle of turn 4's tool calls -> should snap back to th_4!
+      const p1 = store.listTaskItemsPage(task.id, { limit: 9 });
+      assert.equal(p1.totalCount, 31);
+      assert.equal(p1.hasMore, true);
+      assert.equal(p1.items[0].id, "th_4");
+      assert.equal(p1.items[p1.items.length - 1].id, "ft_5");
+      assert.ok(p1.oldestSeq !== null);
+
+      // Walk remaining pages backwards until hasMore === false
+      const collected = [...p1.items];
+      let cursor: number | null = p1.oldestSeq;
+      let hasMore: boolean = p1.hasMore;
+      let pageCount = 1;
+      while (hasMore && cursor !== null) {
+        const nextPage = store.listTaskItemsPage(task.id, { limit: 8, beforeSeq: cursor });
+        pageCount += 1;
+        collected.unshift(...nextPage.items);
+        cursor = nextPage.oldestSeq;
+        hasMore = nextPage.hasMore;
+      }
+
+      assert.ok(pageCount >= 3);
+      assert.deepEqual(
+        collected.map((it) => it.id),
+        insertedIds
+      );
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
 });

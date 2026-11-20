@@ -34,6 +34,7 @@ import type {
   SemanticState,
   SkillRecord,
   SteeringDirective,
+  TaskItemsPageResponse,
   TaskProviderId,
   TaskRecord,
   TaskStatus,
@@ -153,6 +154,8 @@ export class AventStore {
         created_at TEXT NOT NULL,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
       );
+
+      CREATE INDEX IF NOT EXISTS idx_task_items_task_seq ON task_items(task_id, seq);
 
       CREATE TABLE IF NOT EXISTS semantic_states (
         task_id TEXT NOT NULL,
@@ -1141,6 +1144,99 @@ export class AventStore {
       .prepare(`SELECT item_json FROM task_items WHERE task_id = ? ORDER BY seq ASC`)
       .all(taskId) as Array<{ item_json: string }>;
     return rows.map((r) => JSON.parse(r.item_json) as TranscriptItem);
+  }
+
+  public listTaskItemsPage(
+    taskId: string,
+    opts?: { limit?: number; beforeSeq?: number }
+  ): TaskItemsPageResponse {
+    const countRow = this.db
+      .prepare(`SELECT COUNT(*) AS cnt FROM task_items WHERE task_id = ?`)
+      .get(taskId) as { cnt?: number } | undefined;
+    const totalCount = Number(countRow?.cnt ?? 0);
+
+    if (opts?.limit === undefined && opts?.beforeSeq === undefined) {
+      const rows = this.db
+        .prepare(`SELECT seq, item_json FROM task_items WHERE task_id = ? ORDER BY seq ASC`)
+        .all(taskId) as Array<{ seq: number; item_json: string }>;
+      return {
+        items: rows.map((r) => JSON.parse(r.item_json) as TranscriptItem),
+        totalCount,
+        hasMore: false,
+        oldestSeq: rows.length > 0 ? Number(rows[0].seq) : null,
+      };
+    }
+
+    const limit = Math.max(1, Math.min(500, Math.floor(opts?.limit ?? 60)));
+    const beforeSeq =
+      opts?.beforeSeq !== undefined && Number.isFinite(opts.beforeSeq)
+        ? Math.floor(opts.beforeSeq)
+        : undefined;
+
+    const rawRows = (
+      beforeSeq !== undefined
+        ? this.db
+            .prepare(
+              `SELECT seq, kind, item_json FROM task_items
+               WHERE task_id = ? AND seq < ?
+               ORDER BY seq DESC
+               LIMIT ?`
+            )
+            .all(taskId, beforeSeq, limit + 1)
+        : this.db
+            .prepare(
+              `SELECT seq, kind, item_json FROM task_items
+               WHERE task_id = ?
+               ORDER BY seq DESC
+               LIMIT ?`
+            )
+            .all(taskId, limit + 1)
+    ) as Array<{ seq: number; kind: string; item_json: string }>;
+
+    let hasMore = rawRows.length > limit;
+    const pageRows = rawRows.slice(0, limit).reverse();
+
+    // Snap the upper boundary to a non-step item when possible so a pulse's StepsGroup isn't split mid-group
+    if (
+      hasMore &&
+      pageRows.length > 0 &&
+      (pageRows[0].kind === "thinking" || pageRows[0].kind === "tool")
+    ) {
+      const leadingStepRows = this.db
+        .prepare(
+          `SELECT seq, kind, item_json FROM task_items
+           WHERE task_id = ? AND seq < ?
+           ORDER BY seq DESC
+           LIMIT 24`
+        )
+        .all(taskId, pageRows[0].seq) as Array<{
+        seq: number;
+        kind: string;
+        item_json: string;
+      }>;
+      const extraSteps: Array<{ seq: number; kind: string; item_json: string }> = [];
+      for (const r of leadingStepRows) {
+        if (r.kind === "thinking" || r.kind === "tool") {
+          extraSteps.push(r);
+        } else {
+          break;
+        }
+      }
+      if (extraSteps.length > 0) {
+        pageRows.unshift(...extraSteps.reverse());
+        const olderExists = this.db
+          .prepare(`SELECT 1 AS ok FROM task_items WHERE task_id = ? AND seq < ? LIMIT 1`)
+          .get(taskId, pageRows[0].seq) as { ok?: number } | undefined;
+        hasMore = Boolean(olderExists?.ok);
+      }
+    }
+
+    return {
+      items: pageRows.map((r) => JSON.parse(r.item_json) as TranscriptItem),
+      totalCount,
+      hasMore,
+      oldestSeq: pageRows.length > 0 ? Number(pageRows[0].seq) : null,
+    };
   }
 
   public appendEvent(taskId: string, type: AventEventType, payload: string): AventEvent {

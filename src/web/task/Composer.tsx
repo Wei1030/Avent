@@ -21,6 +21,7 @@ export function Composer({
   useWorktree = false,
   onDraftConfigChange,
   onCreatedTask,
+  onMessageSent,
 }: {
   task: TaskRecord;
   draftKey: string;
@@ -28,6 +29,7 @@ export function Composer({
   useWorktree?: boolean;
   onDraftConfigChange?: (patch: Partial<NewTaskConfig>) => void;
   onCreatedTask?: (task: TaskRecord) => void;
+  onMessageSent?: () => void;
 }) {
   const nav = useNavigate();
   const {
@@ -218,6 +220,7 @@ export function Composer({
       if (res.queued) {
         toast("已加入待发队列，当前轮次结束后自动执行", "good");
       }
+      onMessageSent?.();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "crit");
     } finally {

@@ -68,9 +68,11 @@ export function TranscriptView({
     <>
       {blocks.map((blk, idx) => {
         if (Array.isArray(blk)) {
+          const blockKey = `steps_${blk[0].id}`;
           return (
             <StepsGroup
-              key={`steps_${blk[0].id}`}
+              key={blockKey}
+              blockKey={blockKey}
               steps={blk}
               workspaceId={task.workspaceId}
               taskId={task.id}
@@ -82,7 +84,7 @@ export function TranscriptView({
         switch (blk.kind) {
           case "user":
             return (
-              <div key={blk.id} className="umsg">
+              <div key={blk.id} data-block-key={blk.id} className="umsg">
                 <UserAvatar size={12} />
                 <div className="text">{blk.text}</div>
                 {(blk.refs.length > 0 || blk.attachments.length > 0) && (
@@ -118,7 +120,7 @@ export function TranscriptView({
 
           case "text":
             return (
-              <div key={blk.id} className="atext">
+              <div key={blk.id} data-block-key={blk.id} className="atext">
                 <Markdown text={blk.text} />
                 {blk.streaming && <span className="caret" />}
                 {blk.aborted && <span className="aborted-tag">（已停止）</span>}
@@ -127,7 +129,7 @@ export function TranscriptView({
 
           case "footer":
             return (
-              <div key={blk.id} className="footer-line">
+              <div key={blk.id} data-block-key={blk.id} className="footer-line">
                 {blk.stopReason === "interrupted" ? (
                   <>
                     <Icon name="stop" size={11} />第 {blk.turn} 轮 · 已停止
@@ -144,7 +146,7 @@ export function TranscriptView({
 
           case "notice":
             return (
-              <div key={blk.id} className={cx("notice", blk.tone)}>
+              <div key={blk.id} data-block-key={blk.id} className={cx("notice", blk.tone)}>
                 <Icon
                   name={
                     blk.tone === "good" ? "check" : blk.tone === "warn" ? "warning" : "info"
@@ -171,11 +173,13 @@ export function TranscriptView({
 }
 
 const StepsGroup = memo(function StepsGroup({
+  blockKey,
   steps,
   workspaceId,
   taskId,
   live,
 }: {
+  blockKey: string;
   steps: StepItem[];
   workspaceId: string;
   taskId: string;
@@ -197,7 +201,7 @@ const StepsGroup = memo(function StepsGroup({
     : lastStep?.kind === "thinking" && lastStep.streaming
       ? "正在思考…"
       : activeTool
-        ? `${activeTool.tool} ${activeTool.detail}`
+        ? `${activeTool.tool} ${activeTool.detail}`.replace(/\s+/g, " ").trim()
         : "";
 
   const countSummary = [
@@ -208,21 +212,29 @@ const StepsGroup = memo(function StepsGroup({
     .join(" · ");
 
   return (
-    <div className="steps">
+    <div className="steps" data-block-key={blockKey}>
       <div className="steps-head" onClick={() => setOpen(!open)}>
-        <Icon name={open ? "chevDown" : "chevRight"} size={14} />
+        <Icon name={open ? "chevDown" : "chevRight"} size={14} className="steps-chev" />
         <span className="counts">{countSummary}</span>
         {uniqueToolNames.slice(0, 4).map((name) => (
-          <Chip key={name} mono>
-            {name}
+          <Chip key={name} mono className="steps-chip" title={name}>
+            <span className="steps-chip-label">{name}</span>
           </Chip>
         ))}
-        {hasWaiting && <Chip tone="warn">等待确认</Chip>}
-        {failedCount > 0 && <Chip tone="crit">{failedCount} 项未执行</Chip>}
+        {hasWaiting && (
+          <Chip tone="warn" className="steps-chip">
+            等待确认
+          </Chip>
+        )}
+        {failedCount > 0 && (
+          <Chip tone="crit" className="steps-chip">
+            {failedCount} 项未执行
+          </Chip>
+        )}
         {liveActivity && (
-          <span className="now">
+          <span className="now" title={liveActivity}>
             <span className="spinner" />
-            {liveActivity}
+            <span className="now-text">{liveActivity}</span>
           </span>
         )}
       </div>
@@ -248,13 +260,14 @@ function ThinkingBlock({
   item: Extract<TranscriptItem, { kind: "thinking" }>;
 }) {
   const [open, setOpen] = useState(false);
+  const previewText = item.text.replace(/\s+/g, " ").trim();
   return (
     <div className="thinking">
       <div className="thinking-head" onClick={() => setOpen(!open)}>
         <Icon name={open ? "chevDown" : "chevRight"} size={13} />
         <Icon name="bulb" size={13} />
         <b>{item.streaming ? "思考中…" : `思考 · ${item.seconds} 秒`}</b>
-        {!open && <span className="pv">{item.text}</span>}
+        {!open && <span className="pv">{previewText}</span>}
       </div>
       {open && <div className="thinking-body">{item.text}</div>}
     </div>

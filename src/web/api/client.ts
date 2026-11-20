@@ -16,6 +16,7 @@ import type {
   ProviderStatusInfo,
   SkillRecord,
   TaskDetailResponse,
+  TaskItemsPageResponse,
   TaskProviderId,
   TaskRecord,
   TaskRef,
@@ -159,7 +160,24 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  getTaskDetail: (id: string) => req<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(id)}`),
+  getTaskDetail: (id: string, opts?: { limit?: number }) => {
+    const qs = opts?.limit && opts.limit > 0 ? `?limit=${Math.floor(opts.limit)}` : "";
+    return req<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(id)}${qs}`);
+  },
+
+  getTaskItemsPage: (id: string, opts?: { beforeSeq?: number | null; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.beforeSeq !== undefined && opts.beforeSeq !== null) {
+      params.set("beforeSeq", String(opts.beforeSeq));
+    }
+    if (opts?.limit && opts.limit > 0) {
+      params.set("limit", String(Math.floor(opts.limit)));
+    }
+    const qs = params.toString();
+    return req<TaskItemsPageResponse>(
+      `/api/tasks/${encodeURIComponent(id)}/items${qs ? `?${qs}` : ""}`
+    );
+  },
 
   updateTask: (
     id: string,

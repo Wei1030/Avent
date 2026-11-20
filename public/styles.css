@@ -406,8 +406,15 @@ a:hover { text-decoration: underline; }
 .wt-alert.warn { background: var(--warn-soft); color: var(--warn-ink); }
 .wt-draft-tip { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-line); color: var(--ink-2); font-size: 12px; }
 
-.transcript { flex: 1; overflow: auto; padding: 18px 24px 12px; overflow-anchor: none; }
-.transcript-inner { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+.transcript-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.transcript { flex: 1; min-height: 0; overflow: auto; padding: 18px 24px 12px; overflow-anchor: none; }
+.transcript-inner { max-width: 920px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.history-loader { display: flex; justify-content: center; padding: 2px 0 6px; font-size: 12px; color: var(--muted); }
+.history-loader.done { font-size: 11.5px; opacity: .75; }
+.history-loader-btn { border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-2); font-size: 12px; padding: 4px 12px; border-radius: 999px; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.history-loader-btn:hover { background: var(--surface-3); border-color: var(--border-strong); color: var(--ink); }
+.jump-bottom-btn { position: absolute; right: 26px; bottom: 14px; z-index: 8; display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 500; cursor: pointer; box-shadow: 0 4px 14px rgba(0, 0, 0, .12); transition: background .12s, transform .12s; }
+.jump-bottom-btn:hover { background: var(--surface-2); transform: translateY(-1px); }
 .dock { flex: none; padding: 0 24px 14px; }
 .dock-inner { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
 
@@ -425,23 +432,31 @@ a:hover { text-decoration: underline; }
 .caret { display: inline-block; width: 7px; height: 15px; background: var(--accent); vertical-align: -2px; margin-left: 2px; animation: pulse 1s infinite; }
 .aborted-tag { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
 
-.thinking { border: 1px dashed var(--border-strong); background: var(--surface-2); border-radius: 7px; }
-.thinking-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.thinking { border: 1px dashed var(--border-strong); background: var(--surface-2); border-radius: 7px; min-width: 0; max-width: 100%; }
+.thinking-head { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; min-width: 0; overflow: hidden; padding: 6px 10px; cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.thinking-head > svg { flex: none; }
 .thinking-head b { font-weight: 600; flex: none; white-space: nowrap; }
-.thinking-head .pv { flex: 1; min-width: 0; font-style: italic; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thinking-head .pv { flex: 1 1 0; min-width: 0; font-style: italic; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thinking-body { padding: 0 12px 10px 32px; font-size: 12.5px; color: var(--ink-2); white-space: pre-wrap; max-height: 240px; overflow: auto; }
 
-.steps-head { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 4px; cursor: pointer; color: var(--muted); font-size: 12.5px; user-select: none; border-radius: 6px; }
+.steps { min-width: 0; max-width: 100%; }
+.steps-head { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; min-width: 0; max-width: 100%; overflow: hidden; padding: 3px 4px; cursor: pointer; color: var(--muted); font-size: 12.5px; user-select: none; border-radius: 6px; }
 .steps-head:hover { color: var(--ink-2); background: var(--surface-2); }
-.steps-head .counts { font-weight: 500; color: var(--ink-2); }
-.steps-head .now { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
-.steps-body { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 2px 7px; padding-left: 14px; border-left: 2px solid var(--border); }
+.steps-head .steps-chev, .steps-head > svg { flex: none; }
+.steps-head .counts { font-weight: 500; color: var(--ink-2); flex: none; white-space: nowrap; }
+.steps-head .steps-chip { flex: none; white-space: nowrap; max-width: 180px; overflow: hidden; }
+.steps-head .steps-chip-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.steps-head .now { display: flex; align-items: center; gap: 6px; flex: 1 1 0; min-width: 0; overflow: hidden; color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
+.steps-head .now .spinner { flex: none; }
+.steps-head .now .now-text { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.steps-body { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 2px 7px; padding-left: 14px; border-left: 2px solid var(--border); min-width: 0; }
 
 .tcard { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .tcard.waiting { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn); }
 .tcard.denied { border-color: var(--crit-line); }
-.thead { display: flex; align-items: center; gap: 9px; padding: 0 12px; height: 34px; background: var(--surface-2); cursor: pointer; }
-.thead .name { font-weight: 600; font-size: 12.5px; }
+.thead { display: flex; align-items: center; flex-wrap: nowrap; gap: 9px; padding: 0 12px; height: 34px; background: var(--surface-2); cursor: pointer; min-width: 0; overflow: hidden; }
+.thead > svg, .thead .spinner, .thead .chip { flex: none; }
+.thead .name { font-weight: 600; font-size: 12.5px; flex: none; white-space: nowrap; }
 .thead .detail { font-family: var(--mono); font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .thead .detail.link:hover { color: var(--accent); text-decoration: underline; }
 .thead .st-ok { color: var(--good-ink); }

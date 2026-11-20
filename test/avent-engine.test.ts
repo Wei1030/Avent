@@ -1746,11 +1746,14 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       assert.equal(store.savePreferences({ contextNetTokenLimit: 14000 }).contextNetTokenLimit, 14000);
 
       // 2. Execute 7 consecutive lightweight tool calls (> old limit of 5) in ONE round -> all 7 MUST be allowed!
-      // Then emit a usage_update crossing the configured 5000-token net limit -> 8th tool call MUST be rejected & compacted!
+      // Then emit a usage_update crossing the configured 5000-token net limit after tool #7 completes ->
+      // session/cancel must fire cleanly AFTER tool #7 finishes (never mid-flight) and trigger Phase 2 compaction!
       store.savePreferences({ contextNetTokenLimit: 5000 });
       const registry = new ProviderRegistry(process.cwd(), store);
       const permissionOutcomes: string[] = [];
       let promptCount = 0;
+      let cancelCount = 0;
+      let cancelResolver: (() => void) | null = null;
 
       const engine = new PulseEngine({
         store,
@@ -1766,6 +1769,10 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
               agentInfo: { name: "mock-eocc", version: "1.0.0" },
             }))
             .onRequest(acp.methods.agent.session.new, async () => ({ sessionId: "sess-eocc-1" }))
+            .onNotification(acp.methods.agent.session.cancel, async () => {
+              cancelCount += 1;
+              cancelResolver?.();
+            })
             .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
               promptCount += 1;
               if (promptCount === 1) {
@@ -1776,10 +1783,22 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
                 });
                 // 7 lightweight tool calls (must all pass — no 5-call cap!)
                 for (let i = 1; i <= 7; i++) {
+                  const tcId = `tc-${i}`;
+                  await ctx.client.notify(acp.methods.client.session.update, {
+                    sessionId: ctx.params.sessionId,
+                    update: {
+                      sessionUpdate: "tool_call",
+                      toolCallId: tcId,
+                      title: `git status #${i}`,
+                      kind: "execute",
+                      status: "pending",
+                      rawInput: { command: "git status" },
+                    },
+                  });
                   const perm = await ctx.client.request(acp.methods.client.session.requestPermission, {
                     sessionId: ctx.params.sessionId,
                     toolCall: {
-                      toolCallId: `tc-${i}`,
+                      toolCallId: tcId,
                       title: `git status #${i}`,
                       kind: "execute",
                       rawInput: { command: "git status" },
@@ -1792,13 +1811,27 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
                   permissionOutcomes.push(
                     perm.outcome.outcome === "selected" ? perm.outcome.optionId : "cancelled"
                   );
+                  await ctx.client.notify(acp.methods.client.session.update, {
+                    sessionId: ctx.params.sessionId,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: tcId,
+                      status: "completed",
+                    },
+                  });
                 }
-                // Now push net tokens over the configured 5000 limit (+6000 over baseline)
+                // Now push net tokens over the configured 5000 limit (+6000 over baseline) after tc-7 finished
                 await ctx.client.notify(acp.methods.client.session.update, {
                   sessionId: ctx.params.sessionId,
                   update: { sessionUpdate: "usage_update", used: 14500, size: 200000 },
                 });
-                // 8th tool call must now be rejected due to net token watermark!
+                // Wait for Avent's post-settle watermark cancel notification
+                await new Promise<void>((resolve) => {
+                  if (cancelCount > 0) return resolve();
+                  cancelResolver = resolve;
+                  setTimeout(resolve, 400);
+                });
+                // Any subsequent post-cancel tool call must be rejected cleanly
                 const perm8 = await ctx.client.request(acp.methods.client.session.requestPermission, {
                   sessionId: ctx.params.sessionId,
                   toolCall: {
@@ -1863,6 +1896,7 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
       engine.sendUserMessage(task.id, { text: "测试纯 Token 净增控制" });
       await done;
 
+      assert.equal(cancelCount, 1);
       assert.deepEqual(permissionOutcomes, [
         "allow",
         "allow",
@@ -1988,6 +2022,214 @@ describe("Avent Sessionless Workbench & SSSM Runtime", () => {
         collected.map((it) => it.id),
         insertedIds
       );
+    } finally {
+      store.close();
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    }
+  });
+
+  it("never kills pending/in-flight write_file or parallel tool batches when token watermark is crossed, cancelling only after tools settle", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "avent-inflight-"));
+    const dbDir = path.join(tmpDir, ".avent");
+    const store = new AventStore(dbDir, tmpDir);
+    try {
+      store.savePreferences({ contextNetTokenLimit: 5000 });
+      const registry = new ProviderRegistry(process.cwd(), store);
+      const targetFile = path.join(tmpDir, "scan_r1i.py");
+      const largeScript = "# scan script\n" + "print('hello world from scan_r1i')\n".repeat(800); // ~28KB (>5k tokens)
+
+      const timeline: string[] = [];
+      let cancelFired = false;
+      let cancelWhileWritePending = false;
+      let writeFinished = false;
+      let promptCount = 0;
+      let cancelResolver: (() => void) | null = null;
+
+      const engine = new PulseEngine({
+        store,
+        registry,
+        projectRoot: process.cwd(),
+        aventApiUrl: "http://127.0.0.1:0",
+        mockAgentFactory: () =>
+          acp
+            .agent({ name: "mock-inflight-agent" })
+            .onRequest(acp.methods.agent.initialize, async () => ({
+              protocolVersion: acp.PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { close: {} } },
+              agentInfo: { name: "mock-inflight", version: "1.0.0" },
+            }))
+            .onRequest(acp.methods.agent.session.new, async () => ({ sessionId: "sess-inflight-1" }))
+            .onNotification(acp.methods.agent.session.cancel, async () => {
+              cancelFired = true;
+              if (!writeFinished) {
+                cancelWhileWritePending = true;
+              }
+              timeline.push("session_cancel");
+              cancelResolver?.();
+            })
+            .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+              promptCount += 1;
+              if (promptCount === 1) {
+                // Heavy xhigh thinking already pushes close to / past 5000 tokens
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: {
+                    sessionUpdate: "agent_thought_chunk",
+                    content: { type: "text", text: "deep reasoning ".repeat(1500) },
+                  },
+                });
+
+                // Parallel batch: Read #1 + huge Write #2 (Write alone is >5000 tokens!)
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: "batch-read-1",
+                    name: "Read",
+                    title: "package.json",
+                    kind: "read",
+                    status: "pending",
+                    rawInput: { file_path: "package.json" },
+                  },
+                });
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: "batch-write-2",
+                    name: "write_file",
+                    title: targetFile,
+                    kind: "edit",
+                    status: "pending",
+                    rawInput: { Path: targetFile, Content: largeScript },
+                  },
+                });
+
+                // Read #1 finishes FIRST while Write #2 is still awaiting permission & writing to disk!
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: "batch-read-1",
+                    status: "completed",
+                  },
+                });
+                timeline.push("read_completed");
+
+                // Pause 160ms (> 120ms settle window) while Write #2 is STILL in flight -> MUST NOT cancel!
+                await new Promise((r) => setTimeout(r, 160));
+                assert.equal(cancelFired, false, "must NOT fire session/cancel while Write #2 is still in flight");
+
+                // Write #2 requests permission (even though net tokens >> 5000!) -> MUST BE ALLOWED!
+                const perm = await ctx.client.request(acp.methods.client.session.requestPermission, {
+                  sessionId: ctx.params.sessionId,
+                  toolCall: {
+                    toolCallId: "batch-write-2",
+                    name: "write_file",
+                    title: targetFile,
+                    kind: "edit",
+                    rawInput: { Path: targetFile, Content: largeScript },
+                  },
+                  options: [
+                    { optionId: "allow", name: "Allow", kind: "allow_once" },
+                    { optionId: "reject", name: "Reject", kind: "reject_once" },
+                  ],
+                });
+                assert.equal(
+                  perm.outcome.outcome === "selected" ? perm.outcome.optionId : "cancelled",
+                  "allow"
+                );
+                timeline.push("write_allowed");
+
+                // Actually write the file via fs/write_text_file
+                await ctx.client.request(acp.methods.client.fs.writeTextFile, {
+                  sessionId: ctx.params.sessionId,
+                  path: targetFile,
+                  content: largeScript,
+                });
+                timeline.push("write_flushed");
+
+                // Mark Write #2 completed
+                writeFinished = true;
+                await ctx.client.notify(acp.methods.client.session.update, {
+                  sessionId: ctx.params.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: "batch-write-2",
+                    status: "completed",
+                  },
+                });
+                timeline.push("write_completed");
+
+                // NOW that all tools settled, session/cancel MUST fire cleanly
+                await new Promise<void>((resolve) => {
+                  if (cancelFired) return resolve();
+                  cancelResolver = resolve;
+                  setTimeout(resolve, 400);
+                });
+                return { stopReason: "cancelled" };
+              }
+
+              // Phase 2 compaction prompt
+              timeline.push("phase2_compaction");
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: `<avent_state>${JSON.stringify({
+                      status: "COMPLETED",
+                      deliverableSummary: "scan_r1i.py written cleanly before handoff",
+                      establishedFacts: [],
+                      openHypotheses: [],
+                      appliedChanges: [{ filePath: "scan_r1i.py", summary: "created scan script" }],
+                      verificationChecks: [],
+                      deadEnds: [],
+                      remainingPlan: [],
+                      immediateNextAction: "",
+                    })}</avent_state>`,
+                  },
+                },
+              });
+              return { stopReason: "end_turn" };
+            })
+            .onRequest(acp.methods.agent.session.close, async () => ({})),
+      });
+
+      const task = store.createTask({
+        cwd: tmpDir,
+        providerId: "agy",
+        modelId: "gemini-4-neon",
+        thoughtLevel: "xhigh",
+        permissionMode: "bypassPermissions",
+        draft: true,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        const unsub = engine.subscribe((ev) => {
+          if (ev.type === "pulse_finished" && ev.taskId === task.id) {
+            unsub();
+            setTimeout(resolve, 20);
+          }
+        });
+      });
+      engine.sendUserMessage(task.id, { text: "写出大脚本 scan_r1i.py" });
+      await done;
+
+      assert.equal(cancelWhileWritePending, false);
+      assert.equal(cancelFired, true);
+      assert.equal(promptCount, 2);
+      assert.equal(existsSync(targetFile), true);
+      assert.equal(readFileSync(targetFile, "utf8"), largeScript);
+      assert.deepEqual(timeline, [
+        "read_completed",
+        "write_allowed",
+        "write_flushed",
+        "write_completed",
+        "session_cancel",
+        "phase2_compaction",
+      ]);
     } finally {
       store.close();
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });

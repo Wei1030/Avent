@@ -202,8 +202,13 @@ export async function executeAcpPulse(
   let budgetExhausted = false;
   let cancelSentForWatermark = false;
   let activeSessionId = "";
+  let notifySessionCancel: ((sessionId: string) => void) | null = null;
+  let pendingCancelTimer: ReturnType<typeof setTimeout> | null = null;
 
   let actionCount = 0;
+  let completedToolCount = 0;
+  let pendingPermissionCount = 0;
+  let activeClientOps = 0;
   let baselineTokens = 0;
   let baselineCaptured = false;
   let estimatedInputTokens = estimateTokens(input.workPrompt);
@@ -212,6 +217,9 @@ export async function executeAcpPulse(
   let peakTotalTokens = estimatedInputTokens;
 
   const countedToolCallIds = new Set<string>();
+  const countedRawInputToolIds = new Set<string>();
+  const inFlightToolIds = new Set<string>();
+  const settledToolIds = new Set<string>();
   const toolMetaById = new Map<
     string,
     { tool: string; detail: string; filePath?: string; provenance?: string }
@@ -225,6 +233,63 @@ export async function executeAcpPulse(
       return Math.max(est, Math.max(0, reportedUsedTokens - baselineTokens));
     }
     return est;
+  };
+
+  const isBudgetReached = (): boolean => {
+    const hitActionLimit = input.maxActions > 0 && actionCount >= input.maxActions;
+    return hitActionLimit || computeNetTokens() >= input.netTokenLimit;
+  };
+
+  const hasPendingToolWork = (): boolean =>
+    inFlightToolIds.size > 0 || pendingPermissionCount > 0 || activeClientOps > 0;
+
+  const clearPendingCancelTimer = () => {
+    if (pendingCancelTimer !== null) {
+      clearTimeout(pendingCancelTimer);
+      pendingCancelTimer = null;
+    }
+  };
+
+  const fireWatermarkCancelNow = () => {
+    clearPendingCancelTimer();
+    if (
+      phase !== "WORK" ||
+      cancelSentForWatermark ||
+      input.getCommittedState() !== null ||
+      !activeSessionId ||
+      !notifySessionCancel ||
+      hasPendingToolWork()
+    ) {
+      return;
+    }
+    budgetExhausted = true;
+    cancelSentForWatermark = true;
+    trace(
+      "system",
+      `上下文净增达到交接水位（${computeNetTokens()} / ${input.netTokenLimit}），当前工具已全部执行完毕，平滑切入阶段交接`
+    );
+    notifySessionCancel(activeSessionId);
+  };
+
+  // Defer session/cancel until all in-flight tools settle (plus a short 120ms batch grace window
+  // so sibling tools emitted in the same LLM step are never killed mid-flight).
+  const scheduleCancelIfSettled = () => {
+    if (phase !== "WORK" || cancelSentForWatermark || input.getCommittedState() !== null) {
+      return;
+    }
+    if (isBudgetReached()) {
+      budgetExhausted = true;
+    }
+    if (!budgetExhausted || completedToolCount === 0 || hasPendingToolWork()) {
+      return;
+    }
+    if (pendingCancelTimer !== null) {
+      return;
+    }
+    pendingCancelTimer = setTimeout(() => {
+      pendingCancelTimer = null;
+      fireWatermarkCancelNow();
+    }, 120);
   };
 
   const emitTelemetry = () => {
@@ -286,16 +351,14 @@ export async function executeAcpPulse(
         return selectAllow();
       }
 
-      if (input.getCommittedState() !== null || phase === "COMPACTING") {
+      if (input.getCommittedState() !== null || phase === "COMPACTING" || cancelSentForWatermark) {
+        inFlightToolIds.delete(toolId);
         return selectReject();
       }
 
-      const currentNet = computeNetTokens();
-      const hitActionLimit = input.maxActions > 0 && actionCount >= input.maxActions;
-      if (hitActionLimit || currentNet >= input.netTokenLimit) {
-        budgetExhausted = true;
-        return selectReject();
-      }
+      // NEVER reject an already-generated tool call in requestPermission due to token/action budget!
+      // Cancel any pending batch-settle timer so sibling tools in the same LLM step complete cleanly.
+      clearPendingCancelTimer();
 
       const desc = describeToolCall(rawName, rawTitle, ctx.params.toolCall.rawInput, {
         rawKind,
@@ -309,14 +372,22 @@ export async function executeAcpPulse(
       });
 
       if (input.onCheckPermission) {
-        const decision = await input.onCheckPermission({
-          toolCallId: toolId,
-          rawName,
-          rawTitle,
-          rawKind,
-          rawInput: ctx.params.toolCall.rawInput,
-        });
+        pendingPermissionCount += 1;
+        let decision: ToolPermissionCheckResult;
+        try {
+          decision = await input.onCheckPermission({
+            toolCallId: toolId,
+            rawName,
+            rawTitle,
+            rawKind,
+            rawInput: ctx.params.toolCall.rawInput,
+          });
+        } finally {
+          pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+        }
         if (!decision.allowed) {
+          inFlightToolIds.delete(toolId);
+          settledToolIds.add(toolId);
           input.onToolEvent?.({
             toolCallId: toolId,
             tool: desc.toolName,
@@ -327,6 +398,7 @@ export async function executeAcpPulse(
             denialMessage: decision.denialMessage,
           });
           trace("permission", `已拒绝工具调用: ${desc.toolName} ${desc.displayDetail}`);
+          scheduleCancelIfSettled();
           return selectReject();
         }
         if ((desc.category === "edit" || desc.category === "delete") && desc.filePath) {
@@ -350,8 +422,15 @@ export async function executeAcpPulse(
         countedToolCallIds.add(toolId);
         actionCount += 1;
       }
-      if (ctx.params.toolCall.rawInput) {
+      if (!settledToolIds.has(toolId)) {
+        inFlightToolIds.add(toolId);
+      }
+      if (ctx.params.toolCall.rawInput && !countedRawInputToolIds.has(toolId)) {
+        countedRawInputToolIds.add(toolId);
         estimatedOutputTokens += estimateTokens(JSON.stringify(ctx.params.toolCall.rawInput));
+      }
+      if (isBudgetReached()) {
+        budgetExhausted = true;
       }
 
       input.onToolEvent?.({
@@ -368,104 +447,131 @@ export async function executeAcpPulse(
       return selectAllow();
     })
     .onRequest(acp.methods.client.fs.readTextFile, async (ctx) => {
-      const targetPath = path.isAbsolute(ctx.params.path)
-        ? ctx.params.path
-        : path.resolve(input.cwd, ctx.params.path);
+      clearPendingCancelTimer();
+      activeClientOps += 1;
+      try {
+        const targetPath = path.isAbsolute(ctx.params.path)
+          ? ctx.params.path
+          : path.resolve(input.cwd, ctx.params.path);
 
-      // Secondary boundary gate: reading files outside task.cwd (and outside Avent spillsDir) requires permission
-      const withinReadBounds =
-        isPathInsideRoot(targetPath, input.cwd) ||
-        isPathInsideRoot(targetPath, input.spillsDir);
-      if (!withinReadBounds && input.onCheckPermission) {
-        const decision = await input.onCheckPermission({
-          toolCallId: `fsread:${Date.now()}`,
-          rawName: "Read",
-          rawTitle: targetPath,
-          rawKind: "read",
-          rawInput: { file_path: targetPath },
-        });
-        if (!decision.allowed) {
-          trace("permission", `已拒绝越界读取文件: ${targetPath}`);
-          throw acp.RequestError.invalidParams(
-            undefined,
-            decision.denialMessage || `Permission denied: ${decision.provenance || "read outside workspace rejected"}`
-          );
-        }
-      }
-
-      if (!existsSync(targetPath)) {
-        throw new Error(`File not found: ${targetPath}`);
-      }
-      const raw = readFileSync(targetPath, "utf8");
-      const allLines = raw.split(/\r?\n/);
-      const startIdx = Math.max(0, (ctx.params.line ?? 1) - 1);
-      const sliced =
-        ctx.params.limit && ctx.params.limit > 0
-          ? allLines.slice(startIdx, startIdx + ctx.params.limit).join("\n")
-          : allLines.slice(startIdx).join("\n");
-
-      const guarded = spillIfOversized({
-        spillsDir: input.spillsDir,
-        taskId: input.taskId,
-        label: path.basename(targetPath),
-        content: sliced,
-      });
-      estimatedInputTokens += estimateTokens(guarded.text);
-      emitTelemetry();
-      trace("tool", `读取文件 ${path.relative(input.cwd, targetPath) || path.basename(targetPath)}`);
-      return { content: guarded.text };
-    })
-    .onRequest(acp.methods.client.fs.writeTextFile, async (ctx) => {
-      const targetPath = path.isAbsolute(ctx.params.path)
-        ? ctx.params.path
-        : path.resolve(input.cwd, ctx.params.path);
-      const canonKey = resolveCanonicalPath(targetPath).toLowerCase();
-
-      // Secondary fallback permission gate (catches ACP agents calling fs/write_text_file without prior request_permission)
-      if (input.onCheckPermission) {
-        if (approvedWritePaths.has(canonKey)) {
-          approvedWritePaths.delete(canonKey);
-        } else {
-          const decision = await input.onCheckPermission({
-            toolCallId: `fswrite_perm:${Date.now()}`,
-            rawName: "Write",
-            rawTitle: targetPath,
-            rawKind: "edit",
-            rawInput: { file_path: targetPath },
-          });
+        // Secondary boundary gate: reading files outside task.cwd (and outside Avent spillsDir) requires permission
+        const withinReadBounds =
+          isPathInsideRoot(targetPath, input.cwd) ||
+          isPathInsideRoot(targetPath, input.spillsDir);
+        if (!withinReadBounds && input.onCheckPermission) {
+          pendingPermissionCount += 1;
+          let decision: ToolPermissionCheckResult;
+          try {
+            decision = await input.onCheckPermission({
+              toolCallId: `fsread:${Date.now()}`,
+              rawName: "Read",
+              rawTitle: targetPath,
+              rawKind: "read",
+              rawInput: { file_path: targetPath },
+            });
+          } finally {
+            pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+          }
           if (!decision.allowed) {
-            trace("permission", `已拒绝直接写入文件: ${targetPath}`);
+            trace("permission", `已拒绝越界读取文件: ${targetPath}`);
             throw acp.RequestError.invalidParams(
               undefined,
-              decision.denialMessage || `Permission denied: ${decision.provenance || "write rejected"}`
+              decision.denialMessage || `Permission denied: ${decision.provenance || "read outside workspace rejected"}`
             );
           }
         }
-      }
 
-      const before = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
-      mkdirSync(path.dirname(targetPath), { recursive: true });
-      writeFileSync(targetPath, ctx.params.content, "utf8");
-      estimatedOutputTokens += estimateTokens(ctx.params.content);
-      emitTelemetry();
+        if (!existsSync(targetPath)) {
+          throw new Error(`File not found: ${targetPath}`);
+        }
+        const raw = readFileSync(targetPath, "utf8");
+        const allLines = raw.split(/\r?\n/);
+        const startIdx = Math.max(0, (ctx.params.line ?? 1) - 1);
+        const sliced =
+          ctx.params.limit && ctx.params.limit > 0
+            ? allLines.slice(startIdx, startIdx + ctx.params.limit).join("\n")
+            : allLines.slice(startIdx).join("\n");
 
-      const rel = path.relative(input.cwd, targetPath).replace(/\\/g, "/");
-      const diffLines = buildSimpleLineDiff(before, ctx.params.content);
-      const syntheticId = `fswrite:${rel}:${Date.now()}`;
-      if (phase === "WORK") {
-        input.onToolEvent?.({
-          toolCallId: syntheticId,
-          tool: before === null ? "Write" : "Edit",
-          detail: rel,
-          filePath: rel,
-          status: "ok",
-          output: diffLines.length > 0 ? { type: "diff", lines: diffLines, filePath: rel } : undefined,
+        const guarded = spillIfOversized({
+          spillsDir: input.spillsDir,
+          taskId: input.taskId,
+          label: path.basename(targetPath),
+          content: sliced,
         });
+        estimatedInputTokens += estimateTokens(guarded.text);
+        emitTelemetry();
+        trace("tool", `读取文件 ${path.relative(input.cwd, targetPath) || path.basename(targetPath)}`);
+        return { content: guarded.text };
+      } finally {
+        activeClientOps = Math.max(0, activeClientOps - 1);
+        scheduleCancelIfSettled();
       }
-      trace("tool", `写入文件 ${rel} (${ctx.params.content.length} chars)`);
-      return {};
+    })
+    .onRequest(acp.methods.client.fs.writeTextFile, async (ctx) => {
+      clearPendingCancelTimer();
+      activeClientOps += 1;
+      try {
+        const targetPath = path.isAbsolute(ctx.params.path)
+          ? ctx.params.path
+          : path.resolve(input.cwd, ctx.params.path);
+        const canonKey = resolveCanonicalPath(targetPath).toLowerCase();
+
+        // Secondary fallback permission gate (catches ACP agents calling fs/write_text_file without prior request_permission)
+        if (input.onCheckPermission) {
+          if (approvedWritePaths.has(canonKey)) {
+            approvedWritePaths.delete(canonKey);
+          } else {
+            pendingPermissionCount += 1;
+            let decision: ToolPermissionCheckResult;
+            try {
+              decision = await input.onCheckPermission({
+                toolCallId: `fswrite_perm:${Date.now()}`,
+                rawName: "Write",
+                rawTitle: targetPath,
+                rawKind: "edit",
+                rawInput: { file_path: targetPath },
+              });
+            } finally {
+              pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+            }
+            if (!decision.allowed) {
+              trace("permission", `已拒绝直接写入文件: ${targetPath}`);
+              throw acp.RequestError.invalidParams(
+                undefined,
+                decision.denialMessage || `Permission denied: ${decision.provenance || "write rejected"}`
+              );
+            }
+          }
+        }
+
+        const before = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
+        mkdirSync(path.dirname(targetPath), { recursive: true });
+        writeFileSync(targetPath, ctx.params.content, "utf8");
+        estimatedOutputTokens += estimateTokens(ctx.params.content);
+        emitTelemetry();
+
+        const rel = path.relative(input.cwd, targetPath).replace(/\\/g, "/");
+        const diffLines = buildSimpleLineDiff(before, ctx.params.content);
+        const syntheticId = `fswrite:${rel}:${Date.now()}`;
+        if (phase === "WORK") {
+          input.onToolEvent?.({
+            toolCallId: syntheticId,
+            tool: before === null ? "Write" : "Edit",
+            detail: rel,
+            filePath: rel,
+            status: "ok",
+            output: diffLines.length > 0 ? { type: "diff", lines: diffLines, filePath: rel } : undefined,
+          });
+        }
+        trace("tool", `写入文件 ${rel} (${ctx.params.content.length} chars)`);
+        return {};
+      } finally {
+        activeClientOps = Math.max(0, activeClientOps - 1);
+        scheduleCancelIfSettled();
+      }
     })
     .onRequest(acp.methods.client.terminal.create, async (ctx) => {
+      clearPendingCancelTimer();
       const termId = `term_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const termCwd = ctx.params.cwd || input.cwd;
       const fullCmd = [ctx.params.command, ...(ctx.params.args ?? [])].join(" ").trim();
@@ -477,15 +583,22 @@ export async function executeAcpPulse(
           approvedCommands.delete(fullCmd);
         } else {
           const checkCmd = termCwdOutside ? `cd "${termCwd}" && ${fullCmd}` : fullCmd;
-          const decision = await input.onCheckPermission({
-            toolCallId: `term_perm:${termId}`,
-            rawName: "Bash",
-            rawTitle: checkCmd,
-            rawKind: "execute",
-            rawInput: { command: checkCmd },
-          });
+          pendingPermissionCount += 1;
+          let decision: ToolPermissionCheckResult;
+          try {
+            decision = await input.onCheckPermission({
+              toolCallId: `term_perm:${termId}`,
+              rawName: "Bash",
+              rawTitle: checkCmd,
+              rawKind: "execute",
+              rawInput: { command: checkCmd },
+            });
+          } finally {
+            pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+          }
           if (!decision.allowed) {
             trace("permission", `已拒绝终端命令执行: ${checkCmd}`);
+            scheduleCancelIfSettled();
             throw acp.RequestError.invalidParams(
               undefined,
               decision.denialMessage || `Permission denied: ${decision.provenance || "terminal command rejected"}`
@@ -566,19 +679,26 @@ export async function executeAcpPulse(
     .onRequest(acp.methods.client.terminal.waitForExit, async (ctx) => {
       const t = terminals.get(ctx.params.terminalId);
       if (!t) return {};
-      const res = await t.exitPromise;
-      const guarded = spillIfOversized({
-        spillsDir: input.spillsDir,
-        taskId: input.taskId,
-        label: t.id,
-        content: t.output,
-      });
-      estimatedInputTokens += estimateTokens(guarded.text);
-      emitTelemetry();
-      return {
-        exitCode: res.exitCode ?? undefined,
-        signal: res.signal ?? undefined,
-      };
+      clearPendingCancelTimer();
+      activeClientOps += 1;
+      try {
+        const res = await t.exitPromise;
+        const guarded = spillIfOversized({
+          spillsDir: input.spillsDir,
+          taskId: input.taskId,
+          label: t.id,
+          content: t.output,
+        });
+        estimatedInputTokens += estimateTokens(guarded.text);
+        emitTelemetry();
+        return {
+          exitCode: res.exitCode ?? undefined,
+          signal: res.signal ?? undefined,
+        };
+      } finally {
+        activeClientOps = Math.max(0, activeClientOps - 1);
+        scheduleCancelIfSettled();
+      }
     })
     .onRequest(acp.methods.client.terminal.kill, async (ctx) => {
       const t = terminals.get(ctx.params.terminalId);
@@ -596,12 +716,21 @@ export async function executeAcpPulse(
     .onNotification(acp.methods.client.session.update, async (ctx) => {
       const u = ctx.params.update;
       if (u.sessionUpdate === "agent_thought_chunk" && u.content.type === "text") {
+        // If previous tool step already finished & budget is exhausted, agent just began a brand-new LLM step -> cancel cleanly now!
+        if (phase === "WORK" && budgetExhausted && completedToolCount > 0 && !hasPendingToolWork()) {
+          fireWatermarkCancelNow();
+          return;
+        }
         estimatedOutputTokens += estimateTokens(u.content.text);
         if (phase === "WORK" && u.content.text) {
           input.onThoughtDelta?.(u.content.text);
         }
         emitTelemetry();
       } else if (u.sessionUpdate === "agent_message_chunk" && u.content.type === "text") {
+        if (phase === "WORK" && budgetExhausted && completedToolCount > 0 && !hasPendingToolWork()) {
+          fireWatermarkCancelNow();
+          return;
+        }
         collectedAssistantText += u.content.text;
         estimatedOutputTokens += estimateTokens(u.content.text);
         if (phase === "WORK" && u.content.text) {
@@ -612,13 +741,27 @@ export async function executeAcpPulse(
         const rawName = u.name || "";
         const rawTitle = u.title || "";
         const label = `${rawName} ${rawTitle}`.trim();
+        const isCommit = isAventCommitTool(label);
+        const isTerminalStatus = u.status === "completed" || u.status === "failed";
 
-        if (!isAventCommitTool(label)) {
+        if (!isCommit) {
           if (!countedToolCallIds.has(u.toolCallId)) {
             countedToolCallIds.add(u.toolCallId);
             actionCount += 1;
             trace("tool", `调用工具 #${actionCount}: ${label || u.toolCallId}`);
           }
+          if (isTerminalStatus) {
+            inFlightToolIds.delete(u.toolCallId);
+            if (!settledToolIds.has(u.toolCallId)) {
+              settledToolIds.add(u.toolCallId);
+              completedToolCount += 1;
+            }
+          } else if (!settledToolIds.has(u.toolCallId)) {
+            // Tool is pending / running: cancel any pending batch-settle timer and NEVER send session/cancel mid-flight!
+            clearPendingCancelTimer();
+            inFlightToolIds.add(u.toolCallId);
+          }
+
           const desc = describeToolCall(rawName, rawTitle, u.rawInput, {
             rawKind: u.kind ?? null,
             cwd: input.cwd,
@@ -651,25 +794,24 @@ export async function executeAcpPulse(
           }
         }
 
-        if (u.rawInput) {
+        if (u.rawInput && !countedRawInputToolIds.has(u.toolCallId)) {
+          countedRawInputToolIds.add(u.toolCallId);
           estimatedOutputTokens += estimateTokens(JSON.stringify(u.rawInput));
         }
         emitTelemetry();
 
-        const hitActionLimit = input.maxActions > 0 && actionCount > input.maxActions;
-        if (
-          phase === "WORK" &&
-          !cancelSentForWatermark &&
-          input.getCommittedState() === null &&
-          (hitActionLimit || computeNetTokens() >= input.netTokenLimit) &&
-          activeSessionId
-        ) {
-          budgetExhausted = true;
-          cancelSentForWatermark = true;
-          void ctx.agent.notify(acp.methods.agent.session.cancel, { sessionId: activeSessionId });
+        if (!isCommit) {
+          if (isBudgetReached()) {
+            budgetExhausted = true;
+          }
+          // Only schedule handoff cancel if this tool already arrived completed/failed and nothing else is in flight
+          if (isTerminalStatus) {
+            scheduleCancelIfSettled();
+          }
         }
       } else if (u.sessionUpdate === "tool_call_update") {
         const meta = toolMetaById.get(u.toolCallId);
+        const isTerminalStatus = u.status === "completed" || u.status === "failed";
         if (u.rawOutput) {
           const outStr = typeof u.rawOutput === "string" ? u.rawOutput : JSON.stringify(u.rawOutput);
           estimatedInputTokens += Math.min(estimateTokens(outStr), 3000);
@@ -692,6 +834,16 @@ export async function executeAcpPulse(
             output: extractToolOutput(u.rawOutput, u.content as unknown[] | undefined),
           });
         }
+        if (isTerminalStatus) {
+          inFlightToolIds.delete(u.toolCallId);
+          if (!settledToolIds.has(u.toolCallId)) {
+            settledToolIds.add(u.toolCallId);
+            if (countedToolCallIds.has(u.toolCallId)) {
+              completedToolCount += 1;
+            }
+          }
+          scheduleCancelIfSettled();
+        }
       } else if (u.sessionUpdate === "usage_update") {
         const estSum = estimatedInputTokens + estimatedOutputTokens;
         if (!baselineCaptured && u.used > 0) {
@@ -707,6 +859,11 @@ export async function executeAcpPulse(
           input.onRateLimitEvent?.(claudeRateLimit as RawClaudeRateLimitInfo);
         }
         emitTelemetry();
+        // Mark watermark if crossed, and only trigger handoff once all in-flight tools finish!
+        if (isBudgetReached()) {
+          budgetExhausted = true;
+        }
+        scheduleCancelIfSettled();
       }
     });
 
@@ -770,7 +927,11 @@ export async function executeAcpPulse(
 
   try {
     await clientApp.connectWith(target, async (agent) => {
+      notifySessionCancel = (sid) => {
+        void agent.notify(acp.methods.agent.session.cancel, { sessionId: sid });
+      };
       const abortListener = () => {
+        clearPendingCancelTimer();
         if (activeSessionId) {
           void agent.notify(acp.methods.agent.session.cancel, { sessionId: activeSessionId });
         }
@@ -893,9 +1054,11 @@ export async function executeAcpPulse(
           if (!budgetExhausted && !input.abortSignal?.aborted) {
             throw err;
           }
+        } finally {
+          clearPendingCancelTimer();
         }
 
-        if (input.getCommittedState() === null && !budgetExhausted) {
+        if (input.getCommittedState() === null && !cancelSentForWatermark) {
           const phase1Json = tryExtractFallbackStateJson(collectedAssistantText);
           if (phase1Json) {
             input.onFallbackCommit(phase1Json);
@@ -942,6 +1105,8 @@ export async function executeAcpPulse(
           sessionClosed = true;
         }
       } finally {
+        clearPendingCancelTimer();
+        notifySessionCancel = null;
         input.abortSignal?.removeEventListener("abort", abortListener);
       }
     });
